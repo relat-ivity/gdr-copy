@@ -139,7 +139,11 @@ int main(int argc, char** argv)
     for (size_t bytes : sizes) {
         void* h_src = nullptr;
         void* d_dst = nullptr;
-        cudaHostAlloc(&h_src, bytes, cudaHostAllocPortable);
+        h_src = std::malloc(bytes);
+        if (!h_src) {
+            fprintf(stderr, "malloc failed for H2D host buffer (%zu bytes)\n", bytes);
+            return 1;
+        }
         cudaMalloc(&d_dst, bytes);
         cudaMemset(d_dst, 0, bytes);
         memset(h_src, 0xAB, bytes);
@@ -158,11 +162,19 @@ int main(int argc, char** argv)
                gdr.median_us,  gdr.p99_us,  gdr.bw_GBs,
                cuda.median_us, cuda.p99_us, cuda.bw_GBs);
 
-        cudaFreeHost(h_src);
+        std::free(h_src);
         cudaFree(d_dst);
     }
 
     // ── D2H benchmark ─────────────────────────────────────────────────────
+    GDRCopyLib::shutdown();
+    try {
+        ch = GDRCopyLib::open(gpu_id, nic_name);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Failed to reopen GDR channel for D2H: %s\n", e.what());
+        return 1;
+    }
+
     printf("\n--- Device→Host (D2H) ---\n");
     printf("%-12s | %-28s | %-28s\n",
            "Size", "  GDR (median / p99 / BW)", "  CUDA (median / p99 / BW)");
@@ -173,7 +185,12 @@ int main(int argc, char** argv)
         void* d_src = nullptr;
         void* h_dst = nullptr;
         cudaMalloc(&d_src, bytes);
-        cudaHostAlloc(&h_dst, bytes, cudaHostAllocPortable);
+        h_dst = std::malloc(bytes);
+        if (!h_dst) {
+            fprintf(stderr, "malloc failed for D2H host buffer (%zu bytes)\n", bytes);
+            cudaFree(d_src);
+            return 1;
+        }
         cudaMemset(d_src, 0xCD, bytes);
         memset(h_dst, 0, bytes);
 
@@ -192,7 +209,7 @@ int main(int argc, char** argv)
                cuda.median_us, cuda.p99_us, cuda.bw_GBs);
 
         cudaFree(d_src);
-        cudaFreeHost(h_dst);
+        std::free(h_dst);
     }
 
     // ── Summary ───────────────────────────────────────────────────────────
