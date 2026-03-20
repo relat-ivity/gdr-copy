@@ -82,15 +82,31 @@ public:
 
     /**
      * memcpy_async — post the transfer and return immediately.
-     * Call sync() repeatedly until it returns 0.
-     * Only one async operation may be in-flight per channel.
+     * Completion order is transport-driven and may be out-of-order.
      */
     virtual int memcpy_async(void* dst, const void* src,
                              size_t bytes, GDRCopyKind kind) = 0;
 
     /**
-     * Non-blocking progress check for the last memcpy_async.
-     * Returns 0 when completed, -EAGAIN when still in flight.
+     * memcpy_async_tagged — submit one async request and return request metadata.
+     * req_id identifies the request in completion path; expected_wcs is the
+     * number of CQEs expected for this request (>=1).
+     */
+    virtual int memcpy_async_tagged(void* dst, const void* src,
+                                    size_t bytes, GDRCopyKind kind,
+                                    uint64_t* req_id, int* expected_wcs) = 0;
+
+    /**
+     * poll_wc — non-blocking polling of one completion token.
+     * Returns 0 and sets req_id when one token is observed.
+     * Returns -EAGAIN when no completion is available yet.
+     */
+    virtual int poll_wc(uint64_t* req_id) = 0;
+
+    /**
+     * Non-blocking progress check for pending async operations.
+     * Returns 0 when one operation completion is observed.
+     * Returns -EAGAIN when no operation has completed yet.
      */
     virtual int sync() = 0;
 

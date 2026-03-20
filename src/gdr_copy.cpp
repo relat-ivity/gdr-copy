@@ -52,6 +52,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -192,6 +193,10 @@ public:
                size_t bytes, GDRCopyKind kind) override;
     int memcpy_async(void* dst, const void* src,
                      size_t bytes, GDRCopyKind kind) override;
+    int memcpy_async_tagged(void* dst, const void* src,
+                            size_t bytes, GDRCopyKind kind,
+                            uint64_t* req_id, int* expected_wcs) override;
+    int poll_wc(uint64_t* req_id) override;
     int sync() override;
 
     GDRStats        stats()       const override { return stats_; }
@@ -222,8 +227,9 @@ private:
         bool     is_rdma = false;
         uint64_t wr_id = 0;
         double   t_submit_us = 0.0;
-        bool     in_flight = false;
-    } async_op_;
+        cudaEvent_t done_event = nullptr;  // fallback path completion marker
+    };
+    std::deque<AsyncOp> async_ops_;
 
     int      gpu_id_;
     std::string nic_name_;
@@ -231,6 +237,7 @@ private:
     bool     is_roce_ = false;
     uint64_t submit_wr_id_ = 0;
     uint64_t next_wr_id_ = 1;
+    int pending_wr_total_ = 0;
     mutable std::mutex mtx_;
     GDRStats stats_{};
 
@@ -355,6 +362,11 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
 
 // ── destructor ────────────────────────────────────────────────────────────────
 GDRCopyChannelImpl::~GDRCopyChannelImpl() {
+    for (auto& op : async_ops_) {
+        if (op.done_event) cudaEventDestroy(op.done_event);
+    }
+    async_ops_.clear();
+
     pool_.reset();   // dereg pinned MRs before destroying PD
 
     // Flush MR cache
@@ -477,6 +489,9 @@ int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
                           submit_wr_id_);
 }
 
+// ── CQ poll with timeout ──────────────────────────────────────────────────────
+
+
 // ── H2D ──────────────────────────────────────────────────────────────────────
 int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes)
 {
@@ -508,6 +523,8 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
         remaining -= n;
     }
     return 0;
+        // CPU copy: user src → pinned host (cache-coherent, fast)
+        // RDMA WRITE: pinned host → GPU (NIC DMA, no CPU involvement)
 }
 
 // ── D2H ──────────────────────────────────────────────────────────────────────
@@ -562,16 +579,31 @@ int GDRCopyChannelImpl::memcpy(void* dst, const void* src,
 
 // ── async (fire-and-forget, then sync) ───────────────────────────────────────
 // Submit-only path: this call only posts work requests.
-// Completion is checked by sync() in a non-blocking manner.
-// A production impl would use a dedicated completion thread.
+// Completion is checked by poll_wc()/sync() in a non-blocking manner.
 int GDRCopyChannelImpl::memcpy_async(void* dst, const void* src,
                                       size_t bytes, GDRCopyKind kind)
 {
+    return memcpy_async_tagged(dst, src, bytes, kind, nullptr, nullptr);
+}
+
+int GDRCopyChannelImpl::memcpy_async_tagged(void* dst, const void* src,
+                                      size_t bytes, GDRCopyKind kind,
+                                      uint64_t* req_id, int* expected_wcs)
+{
     if (bytes == 0) return 0;
     std::lock_guard<std::mutex> lk(mtx_);
-    if (async_op_.in_flight) return -EBUSY;
 
     double t0 = now_us();
+    bool is_rdma = gdr_ok_ && (kind == GDR_H2D || kind == GDR_D2H);
+    int pending_wcs = 0;
+    if (is_rdma) {
+        size_t chunk_size = pool_->slot_size();
+        pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
+        if (pending_wcs > QP_MAX_WR)
+            return -E2BIG;
+        if (pending_wr_total_ + pending_wcs > QP_MAX_WR)
+            return -EBUSY;
+    }
 
     uint64_t wr_id = next_wr_id_++;
     submit_wr_id_ = wr_id;
@@ -593,76 +625,114 @@ int GDRCopyChannelImpl::memcpy_async(void* dst, const void* src,
     submit_wr_id_ = 0;
     if (rc != 0) return rc;
 
-    bool is_rdma = gdr_ok_ && (kind == GDR_H2D || kind == GDR_D2H);
-    int pending_wcs = 0;
-    if (is_rdma) {
-        size_t chunk_size = pool_->slot_size();
-        pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
+    AsyncOp op{};
+    op.dst = dst;
+    op.bytes = bytes;
+    op.kind = kind;
+    op.pending_wcs = pending_wcs;
+    op.is_rdma = is_rdma;
+    op.wr_id = wr_id;
+    op.t_submit_us = t0;
+
+    if (!is_rdma) {
+        cudaError_t ce = cudaEventCreateWithFlags(&op.done_event, cudaEventDisableTiming);
+        if (ce != cudaSuccess) return -1;
+        ce = cudaEventRecord(op.done_event, 0);
+        if (ce != cudaSuccess) {
+            cudaEventDestroy(op.done_event);
+            return -1;
+        }
     }
 
-    async_op_.dst = dst;
-    async_op_.bytes = bytes;
-    async_op_.kind = kind;
-    async_op_.pending_wcs = pending_wcs;
-    async_op_.is_rdma = is_rdma;
-    async_op_.wr_id = is_rdma ? wr_id : 0;
-    async_op_.t_submit_us = t0;
-    async_op_.in_flight = true;
+    if (is_rdma)
+        pending_wr_total_ += pending_wcs;
+    async_ops_.push_back(op);
+    if (req_id) *req_id = wr_id;
+    if (expected_wcs) *expected_wcs = is_rdma ? pending_wcs : 1;
     return 0;
 }
 
-int GDRCopyChannelImpl::sync() {
+int GDRCopyChannelImpl::poll_wc(uint64_t* req_id) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (!async_op_.in_flight) return 0;
 
-    // Non-blocking sync: drain at most one completion and return.
-    // This keeps submit latency path free from completion waits.
-    int rc = 0;
-    if (async_op_.is_rdma) {
-        struct ibv_wc wc{};
-        int n = ibv_poll_cq(cq_, 1, &wc);
-        if (n < 0) {
-            rc = -1;
-        } else if (n == 0) {
-            return -EAGAIN;
-        } else if (n == 1 && wc.status != IBV_WC_SUCCESS) {
+    if (async_ops_.empty()) return -EAGAIN;
+
+    auto finalize_op = [&](std::deque<AsyncOp>::iterator it) -> int {
+        double lat = now_us() - it->t_submit_us;
+        stats_.last_latency_us = lat;
+        stats_.avg_latency_us =
+            (stats_.avg_latency_us * stats_.total_ops + lat) /
+            (stats_.total_ops + 1);
+        stats_.total_bytes += it->bytes;
+        stats_.total_ops++;
+        if (it->is_rdma) stats_.rdma_ops++;
+        else             stats_.fallback_ops++;
+        if (it->done_event) cudaEventDestroy(it->done_event);
+        async_ops_.erase(it);
+        if (async_ops_.empty() && pending_wr_total_ > 0) pending_wr_total_ = 0;
+        return 0;
+    };
+
+    struct ibv_wc wc{};
+    int n = ibv_poll_cq(cq_, 1, &wc);
+    if (n < 0) return -1;
+    if (n == 1) {
+        if (wc.status != IBV_WC_SUCCESS) {
             std::cerr << "[gdr_copy] WC error: " << ibv_wc_status_str(wc.status)
                       << " (" << wc.status << ")\n";
-            rc = -1;
-        } else if (n == 1 && wc.wr_id != async_op_.wr_id) {
-            std::cerr << "[gdr_copy] WC wr_id mismatch: got " << wc.wr_id
-                      << ", expected " << async_op_.wr_id << "\n";
-            rc = -1;
-        } else if (n == 1) {
-            async_op_.pending_wcs--;
-            if (async_op_.pending_wcs > 0) return -EAGAIN;
+            return -1;
         }
-    } else {
-        // CUDA fallback path: query default stream without blocking.
-        cudaError_t ce = cudaStreamQuery(0);
+
+        uint64_t wid = wc.wr_id;
+        if (req_id) *req_id = wid;
+
+        auto it = async_ops_.begin();
+        for (; it != async_ops_.end(); ++it) {
+            if (it->wr_id == wid) break;
+        }
+        if (it == async_ops_.end()) {
+            std::cerr << "[gdr_copy] WC wr_id not found: " << wid << "\n";
+            return -1;
+        }
+        if (!it->is_rdma) {
+            std::cerr << "[gdr_copy] unexpected RDMA WC for non-RDMA op wr_id=" << wid << "\n";
+            return -1;
+        }
+
+        if (pending_wr_total_ > 0) pending_wr_total_--;
+        if (it->pending_wcs > 0) it->pending_wcs--;
+        if (it->pending_wcs > 0) return 0;
+        return finalize_op(it);
+    }
+
+    // Fallback path progress without RDMA WC: use CUDA events.
+    for (auto it = async_ops_.begin(); it != async_ops_.end(); ++it) {
+        if (it->is_rdma) continue;
+        cudaError_t ce = cudaEventQuery(it->done_event);
         if (ce == cudaErrorNotReady) {
             (void)cudaGetLastError();
-            return -EAGAIN;
+            continue;
         }
-        if (ce != cudaSuccess) {
-            rc = -1;
-        }
+        if (ce != cudaSuccess) return -1;
+        if (req_id) *req_id = it->wr_id;
+        return finalize_op(it);
     }
 
-    double lat = now_us() - async_op_.t_submit_us;
+    return -EAGAIN;
+}
 
-    stats_.last_latency_us = lat;
-    stats_.avg_latency_us  =
-        (stats_.avg_latency_us * stats_.total_ops + lat) /
-        (stats_.total_ops + 1);
-    stats_.total_bytes += async_op_.bytes;
-    stats_.total_ops++;
-    if (rc == 0) {
-        if (async_op_.is_rdma) stats_.rdma_ops++;
-        else                   stats_.fallback_ops++;
+int GDRCopyChannelImpl::sync() {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (async_ops_.empty()) return 0;
     }
 
-    async_op_ = {};
+    uint64_t req_id = 0;
+    int rc = poll_wc(&req_id);
+    if (rc == -EAGAIN) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (async_ops_.empty()) return 0;
+    }
     return rc;
 }
 
