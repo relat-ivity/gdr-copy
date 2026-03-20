@@ -11,7 +11,7 @@
  *     - transfer-completion latency (issue return -> completion observed)
  *     - median latency (µs)
  *     - p99 latency (µs)
- *     - rate-derived GB/s for each latency bucket
+ *     - GB/s only for transfer-completion tables
  *   for both GDR RDMA path and cudaMemcpyAsync baseline.
  *
  * Why sudo?
@@ -122,10 +122,17 @@ static void print_latency_table(const char* title,
                                 bool issue_table)
 {
     printf("\n--- %s ---\n", title);
-    printf("%-12s | %-28s | %-28s\n",
-           "Size", "  GDR (median / p99 / BW)", "  CUDA (median / p99 / BW)");
-    printf("%-12s-+-%-28s-+-%-28s\n",
-           "------------", "----------------------------", "----------------------------");
+    if (issue_table) {
+        printf("%-12s | %-21s | %-21s\n",
+               "Size", "   GDR (median / p99)  ", "   CUDA (median / p99)");
+        printf("%-12s-+-%-21s-+-%-21s\n",
+               "------------", "-----------------------", "-----------------------");
+    } else {
+        printf("%-12s | %-28s | %-28s\n",
+               "Size", "      GDR (median / p99 / BW)       ", "      CUDA (median / p99 / BW)");
+        printf("%-12s-+-%-28s-+-%-28s\n",
+               "------------", "------------------------------------", "------------------------------------");
+    }
 
     for (const auto& row : rows) {
         const BenchResult& g = issue_table ? row.gdr.issue : row.gdr.transfer;
@@ -133,11 +140,18 @@ static void print_latency_table(const char* title,
         char size_str[32];
         format_size(row.bytes, size_str, sizeof(size_str));
 
-        printf("%-12s | %7.2f µs / %7.2f µs / %5.2f GB/s | "
-               "%7.2f µs / %7.2f µs / %5.2f GB/s\n",
-               size_str,
-               g.median_us, g.p99_us, g.bw_GBs,
-               c.median_us, c.p99_us, c.bw_GBs);
+        if (issue_table) {
+            printf("%-12s | %7.2f µs / %7.2f µs | %7.2f µs / %7.2f µs\n",
+                   size_str,
+                   g.median_us, g.p99_us,
+                   c.median_us, c.p99_us);
+        } else {
+            printf("%-12s | %7.2f µs / %7.2f µs / %5.2f GB/s | "
+                   "%7.2f µs / %7.2f µs / %5.2f GB/s\n",
+                   size_str,
+                   g.median_us, g.p99_us, g.bw_GBs,
+                   c.median_us, c.p99_us, c.bw_GBs);
+        }
     }
 }
 
