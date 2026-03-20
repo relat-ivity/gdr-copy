@@ -1,5 +1,5 @@
 /**
- * bench.cpp  —  GDR Copy vs cudaMemcpy latency/bandwidth benchmark
+ * bench.cpp  —  GDR Copy vs cudaMemcpy async timing benchmark
  *
  * Usage:
  *   sudo ./build/bench [gpu_id] [nic_name]
@@ -7,10 +7,12 @@
  *
  * Output:
  *   For each transfer size × direction, prints:
+ *     - submit (issue) latency
+ *     - transfer-completion latency (issue return -> completion observed)
  *     - median latency (µs)
  *     - p99 latency (µs)
- *     - bandwidth (GB/s)
- *   for both GDR RDMA path and cudaMemcpy baseline.
+ *     - rate-derived GB/s for each latency bucket
+ *   for both GDR RDMA path and cudaMemcpyAsync baseline.
  *
  * Why sudo?
  *   Accessing PCIe config space for GPUDirect registration may require
@@ -22,6 +24,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +48,17 @@ struct BenchResult {
     double bw_GBs;
 };
 
+struct BenchPair {
+    BenchResult issue;
+    BenchResult transfer;
+};
+
+struct DirectionRow {
+    size_t bytes = 0;
+    BenchPair gdr{};
+    BenchPair cuda{};
+};
+
 static BenchResult analyse(std::vector<double>& samples, size_t bytes) {
     std::sort(samples.begin(), samples.end());
     size_t n = samples.size();
@@ -56,39 +70,109 @@ static BenchResult analyse(std::vector<double>& samples, size_t bytes) {
     return r;
 }
 
-// ── run one benchmark cell ────────────────────────────────────────────────────
-static BenchResult run_gdr(std::shared_ptr<GDRCopyChannel> ch,
-                            void* dst, const void* src,
-                            size_t bytes, GDRCopyKind kind,
-                            int warmup, int iters)
+// Measure both submit latency and transfer-completion latency.
+static BenchPair run_gdr_timings(std::shared_ptr<GDRCopyChannel> ch,
+                                 void* dst, const void* src,
+                                 size_t bytes, GDRCopyKind kind,
+                                 int warmup, int iters)
 {
     ch->reset_stats();
-    std::vector<double> samples;
-    samples.reserve(iters);
+    std::vector<double> issue_samples;
+    std::vector<double> transfer_samples;
+    issue_samples.reserve(iters);
+    transfer_samples.reserve(iters);
 
     for (int i = 0; i < warmup + iters; i++) {
         double t0 = now_us();
-        ch->memcpy(dst, src, bytes, kind);
-        double dt = now_us() - t0;
-        if (i >= warmup) samples.push_back(dt);
+        int rc = ch->memcpy_async(dst, src, bytes, kind);
+        double t1 = now_us();
+        if (rc != 0) {
+            fprintf(stderr, "[issue] gdr memcpy_async failed: rc=%d kind=%d bytes=%zu\n",
+                    rc, (int)kind, bytes);
+            std::exit(2);
+        }
+        while (true) {
+            int sc = ch->sync();
+            if (sc == 0) break;
+            if (sc == -EAGAIN) continue;
+            fprintf(stderr, "[issue] gdr sync failed: rc=%d kind=%d bytes=%zu\n",
+                    sc, (int)kind, bytes);
+            std::exit(2);
+        }
+        double t2 = now_us();
+        if (i >= warmup) {
+            issue_samples.push_back(t1 - t0);
+            transfer_samples.push_back(t2 - t1);
+        }
     }
-    return analyse(samples, bytes);
+    BenchPair out{};
+    out.issue = analyse(issue_samples, bytes);
+    out.transfer = analyse(transfer_samples, bytes);
+    return out;
 }
 
-static BenchResult run_cuda(void* dst, const void* src,
-                             size_t bytes, cudaMemcpyKind kind,
-                             int warmup, int iters)
+static void format_size(size_t bytes, char* out, size_t out_len) {
+    if (bytes < (1 << 10))      snprintf(out, out_len, "%zuB", bytes);
+    else if (bytes < (1 << 20)) snprintf(out, out_len, "%zuKiB", bytes >> 10);
+    else                        snprintf(out, out_len, "%zuMiB", bytes >> 20);
+}
+
+static void print_latency_table(const char* title,
+                                const std::vector<DirectionRow>& rows,
+                                bool issue_table)
 {
-    std::vector<double> samples;
-    samples.reserve(iters);
+    printf("\n--- %s ---\n", title);
+    printf("%-12s | %-28s | %-28s\n",
+           "Size", "  GDR (median / p99 / BW)", "  CUDA (median / p99 / BW)");
+    printf("%-12s-+-%-28s-+-%-28s\n",
+           "------------", "----------------------------", "----------------------------");
+
+    for (const auto& row : rows) {
+        const BenchResult& g = issue_table ? row.gdr.issue : row.gdr.transfer;
+        const BenchResult& c = issue_table ? row.cuda.issue : row.cuda.transfer;
+        char size_str[32];
+        format_size(row.bytes, size_str, sizeof(size_str));
+
+        printf("%-12s | %7.2f µs / %7.2f µs / %5.2f GB/s | "
+               "%7.2f µs / %7.2f µs / %5.2f GB/s\n",
+               size_str,
+               g.median_us, g.p99_us, g.bw_GBs,
+               c.median_us, c.p99_us, c.bw_GBs);
+    }
+}
+
+static BenchPair run_cuda_timings(void* dst, const void* src,
+                                  size_t bytes, cudaMemcpyKind kind,
+                                  int warmup, int iters, cudaStream_t stream)
+{
+    std::vector<double> issue_samples;
+    std::vector<double> transfer_samples;
+    issue_samples.reserve(iters);
+    transfer_samples.reserve(iters);
 
     for (int i = 0; i < warmup + iters; i++) {
         double t0 = now_us();
-        cudaMemcpy(dst, src, bytes, kind);
-        double dt = now_us() - t0;
-        if (i >= warmup) samples.push_back(dt);
+        cudaError_t ce = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+        double t1 = now_us();
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[issue] cudaMemcpyAsync failed: %s\n", cudaGetErrorString(ce));
+            std::exit(2);
+        }
+        ce = cudaStreamSynchronize(stream);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[issue] cudaStreamSynchronize failed: %s\n", cudaGetErrorString(ce));
+            std::exit(2);
+        }
+        double t2 = now_us();
+        if (i >= warmup) {
+            issue_samples.push_back(t1 - t0);
+            transfer_samples.push_back(t2 - t1);
+        }
     }
-    return analyse(samples, bytes);
+    BenchPair out{};
+    out.issue = analyse(issue_samples, bytes);
+    out.transfer = analyse(transfer_samples, bytes);
+    return out;
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -120,6 +204,7 @@ int main(int argc, char** argv)
     GDRStats s = ch->stats();
     bool gdr_active = (s.fallback_ops == 0);
     printf("GPUDirect RDMA path: %s\n\n", gdr_active ? "ACTIVE" : "FALLBACK (cudaMemcpy)");
+    printf("Benchmark mode: issue + transfer timing (async submit/completion split)\n\n");
 
     // ── Transfer sizes to sweep ───────────────────────────────────────────
     std::vector<size_t> sizes;
@@ -129,12 +214,12 @@ int main(int argc, char** argv)
     static const int WARMUP = 10;
     static const int ITERS  = 100;
 
-    // ── H2D benchmark ─────────────────────────────────────────────────────
-    printf("--- Host→Device (H2D) ---\n");
-    printf("%-12s | %-28s | %-28s\n",
-           "Size", "  GDR (median / p99 / BW)", "  CUDA (median / p99 / BW)");
-    printf("%-12s-+-%-28s-+-%-28s\n",
-           "------------", "----------------------------", "----------------------------");
+    // Async benchmark: split timing into issue and transfer-completion parts.
+    cudaStream_t issue_stream{};
+    cudaStreamCreate(&issue_stream);
+
+    std::vector<DirectionRow> h2d_rows;
+    h2d_rows.reserve(sizes.size());
 
     for (size_t bytes : sizes) {
         void* h_src = nullptr;
@@ -142,66 +227,55 @@ int main(int argc, char** argv)
         cudaHostAlloc(&h_src, bytes, cudaHostAllocPortable);
         cudaMalloc(&d_dst, bytes);
         cudaMemset(d_dst, 0, bytes);
-        memset(h_src, 0xAB, bytes);
+        memset(h_src, 0xA5, bytes);
 
-        BenchResult gdr  = run_gdr(ch, d_dst, h_src, bytes, GDR_H2D, WARMUP, ITERS);
-        BenchResult cuda = run_cuda(d_dst, h_src, bytes, cudaMemcpyHostToDevice, WARMUP, ITERS);
+        BenchPair gdr  = run_gdr_timings(ch, d_dst, h_src, bytes, GDR_H2D, WARMUP, ITERS);
+        BenchPair cuda = run_cuda_timings(d_dst, h_src, bytes, cudaMemcpyHostToDevice,
+                                          WARMUP, ITERS, issue_stream);
 
-        char size_str[32];
-        if (bytes < (1 << 10))      snprintf(size_str, sizeof(size_str), "%zuB",    bytes);
-        else if (bytes < (1 << 20)) snprintf(size_str, sizeof(size_str), "%zuKiB",  bytes >> 10);
-        else                        snprintf(size_str, sizeof(size_str), "%zuMiB",  bytes >> 20);
-
-        printf("%-12s | %7.2f µs / %7.2f µs / %5.2f GB/s | "
-               "%7.2f µs / %7.2f µs / %5.2f GB/s\n",
-               size_str,
-               gdr.median_us,  gdr.p99_us,  gdr.bw_GBs,
-               cuda.median_us, cuda.p99_us, cuda.bw_GBs);
+        h2d_rows.push_back(DirectionRow{bytes, gdr, cuda});
 
         cudaFreeHost(h_src);
         cudaFree(d_dst);
     }
 
-    // ── D2H benchmark ─────────────────────────────────────────────────────
+    print_latency_table("Host->Device Issue Latency", h2d_rows, true);
+    print_latency_table("Host->Device Transfer Latency", h2d_rows, false);
+
+    // Reopen channel before D2H sweep to avoid stale GPU MR reuse.
     GDRCopyLib::shutdown();
     try {
         ch = GDRCopyLib::open(gpu_id, nic_name);
     } catch (const std::exception& e) {
-        fprintf(stderr, "Failed to reopen GDR channel for D2H: %s\n", e.what());
+        fprintf(stderr, "Failed to reopen GDR channel for D2H issue bench: %s\n", e.what());
         return 1;
     }
 
-    printf("\n--- Device→Host (D2H) ---\n");
-    printf("%-12s | %-28s | %-28s\n",
-           "Size", "  GDR (median / p99 / BW)", "  CUDA (median / p99 / BW)");
-    printf("%-12s-+-%-28s-+-%-28s\n",
-           "------------", "----------------------------", "----------------------------");
+    std::vector<DirectionRow> d2h_rows;
+    d2h_rows.reserve(sizes.size());
 
     for (size_t bytes : sizes) {
         void* d_src = nullptr;
         void* h_dst = nullptr;
         cudaMalloc(&d_src, bytes);
         cudaHostAlloc(&h_dst, bytes, cudaHostAllocPortable);
-        cudaMemset(d_src, 0xCD, bytes);
+        cudaMemset(d_src, 0x5A, bytes);
         memset(h_dst, 0, bytes);
 
-        BenchResult gdr  = run_gdr(ch, h_dst, d_src, bytes, GDR_D2H, WARMUP, ITERS);
-        BenchResult cuda = run_cuda(h_dst, d_src, bytes, cudaMemcpyDeviceToHost, WARMUP, ITERS);
+        BenchPair gdr  = run_gdr_timings(ch, h_dst, d_src, bytes, GDR_D2H, WARMUP, ITERS);
+        BenchPair cuda = run_cuda_timings(h_dst, d_src, bytes, cudaMemcpyDeviceToHost,
+                                          WARMUP, ITERS, issue_stream);
 
-        char size_str[32];
-        if (bytes < (1 << 10))      snprintf(size_str, sizeof(size_str), "%zuB",    bytes);
-        else if (bytes < (1 << 20)) snprintf(size_str, sizeof(size_str), "%zuKiB",  bytes >> 10);
-        else                        snprintf(size_str, sizeof(size_str), "%zuMiB",  bytes >> 20);
-
-        printf("%-12s | %7.2f µs / %7.2f µs / %5.2f GB/s | "
-               "%7.2f µs / %7.2f µs / %5.2f GB/s\n",
-               size_str,
-               gdr.median_us,  gdr.p99_us,  gdr.bw_GBs,
-               cuda.median_us, cuda.p99_us, cuda.bw_GBs);
+        d2h_rows.push_back(DirectionRow{bytes, gdr, cuda});
 
         cudaFree(d_src);
         cudaFreeHost(h_dst);
     }
+
+    print_latency_table("Device->Host Issue Latency", d2h_rows, true);
+    print_latency_table("Device->Host Transfer Latency", d2h_rows, false);
+
+    cudaStreamDestroy(issue_stream);
 
     // ── Summary ───────────────────────────────────────────────────────────
     GDRStats final_s = ch->stats();

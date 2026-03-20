@@ -49,6 +49,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -80,15 +81,6 @@ static void check_cuda(cudaError_t e, const char* ctx) {
 }
 
 // Returns true only for host pointers allocated/registered as CUDA pinned memory.
-static bool is_cuda_pinned_host_ptr(const void* p) {
-    unsigned int flags = 0;
-    cudaError_t ce = cudaHostGetFlags(&flags, const_cast<void*>(p));
-    if (ce == cudaSuccess) return true;
-    // Clear error state from probing non-pinned pointers.
-    (void)cudaGetLastError();
-    return false;
-}
-
 // ── RC QP helpers ─────────────────────────────────────────────────────────────
 struct QPEndpoint {
     uint32_t qpn;
@@ -226,7 +218,10 @@ private:
         void*    dst;
         size_t   bytes;
         GDRCopyKind kind;
-        PinnedSlot* slot;
+        int      pending_wcs = 0;
+        bool     is_rdma = false;
+        uint64_t wr_id = 0;
+        double   t_submit_us = 0.0;
         bool     in_flight = false;
     } async_op_;
 
@@ -234,6 +229,8 @@ private:
     std::string nic_name_;
     bool     gdr_ok_  = false;   // false → fallback to cudaMemcpy
     bool     is_roce_ = false;
+    uint64_t submit_wr_id_ = 0;
+    uint64_t next_wr_id_ = 1;
     mutable std::mutex mtx_;
     GDRStats stats_{};
 
@@ -245,17 +242,22 @@ private:
     int do_d2h(void*       dst_host, const void* src_gpu,  size_t bytes);
     int do_d2d(void* dst_gpu, const void* src_gpu,  size_t bytes);
 
-    // Post one RDMA_WRITE WR and poll for completion.
+    // Submit one RDMA_WRITE WR (no completion wait).
     int rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
                    uint64_t local_host_va, uint32_t lkey,
                    size_t   bytes);
+    int rdma_write_post(uint64_t remote_gpu_va, uint32_t rkey,
+                        uint64_t local_host_va, uint32_t lkey,
+                        size_t   bytes, uint64_t wr_id);
 
-    // Post one RDMA_READ WR and poll for completion.
+    // Submit one RDMA_READ WR (no completion wait).
     int rdma_read(uint64_t local_host_va, uint32_t lkey,
                   uint64_t remote_gpu_va, uint32_t rkey,
                   size_t   bytes);
+    int rdma_read_post(uint64_t local_host_va, uint32_t lkey,
+                       uint64_t remote_gpu_va, uint32_t rkey,
+                       size_t   bytes, uint64_t wr_id);
 
-    int poll_cq(int expected_wcs);
 };
 
 // ── constructor ───────────────────────────────────────────────────────────────
@@ -408,9 +410,9 @@ struct ibv_mr* GDRCopyChannelImpl::get_host_mr(uint64_t host_va, size_t len) {
 }
 
 // ── RDMA WRITE (H2D): pinned host → GPU ──────────────────────────────────────
-int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
-                                    uint64_t local_host_va, uint32_t lkey,
-                                    size_t   bytes)
+int GDRCopyChannelImpl::rdma_write_post(uint64_t remote_gpu_va, uint32_t rkey,
+                                        uint64_t local_host_va, uint32_t lkey,
+                                        size_t   bytes, uint64_t wr_id)
 {
     struct ibv_sge sge{};
     sge.addr   = local_host_va;
@@ -418,6 +420,7 @@ int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
     sge.lkey   = lkey;          // ← host-side MR lkey (registered via pd_)
 
     struct ibv_send_wr wr{};
+    wr.wr_id                  = wr_id;
     wr.opcode                 = IBV_WR_RDMA_WRITE;
     wr.sg_list                = &sge;
     wr.num_sge                = 1;
@@ -429,13 +432,21 @@ int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
     if (ibv_post_send(qp_, &wr, &bad) != 0)
         return -1;
 
-    return poll_cq(1);
+    return 0;
+}
+
+int GDRCopyChannelImpl::rdma_write(uint64_t remote_gpu_va, uint32_t rkey,
+                                    uint64_t local_host_va, uint32_t lkey,
+                                    size_t   bytes)
+{
+    return rdma_write_post(remote_gpu_va, rkey, local_host_va, lkey, bytes,
+                           submit_wr_id_);
 }
 
 // ── RDMA READ (D2H): GPU → pinned host ───────────────────────────────────────
-int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
-                                   uint64_t remote_gpu_va, uint32_t rkey,
-                                   size_t   bytes)
+int GDRCopyChannelImpl::rdma_read_post(uint64_t local_host_va, uint32_t lkey,
+                                       uint64_t remote_gpu_va, uint32_t rkey,
+                                       size_t   bytes, uint64_t wr_id)
 {
     struct ibv_sge sge{};
     sge.addr   = local_host_va;
@@ -443,6 +454,7 @@ int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
     sge.lkey   = lkey;
 
     struct ibv_send_wr wr{};
+    wr.wr_id              = wr_id;
     wr.opcode              = IBV_WR_RDMA_READ;
     wr.sg_list             = &sge;
     wr.num_sge             = 1;
@@ -454,73 +466,32 @@ int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
     if (ibv_post_send(qp_, &wr, &bad) != 0)
         return -1;
 
-    return poll_cq(1);
+    return 0;
 }
 
-// ── CQ poll with timeout ──────────────────────────────────────────────────────
-int GDRCopyChannelImpl::poll_cq(int expected) {
-    struct ibv_wc wc{};
-    double deadline = now_us() + MAX_POLL_US;
-    int got = 0;
-    while (got < expected) {
-        int n = ibv_poll_cq(cq_, 1, &wc);
-        if (n < 0) return -1;
-        if (n == 1) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                std::cerr << "[gdr_copy] WC error: " << ibv_wc_status_str(wc.status)
-                          << " (" << wc.status << ")\n";
-                return -1;
-            }
-            got++;
-        }
-        if (now_us() > deadline) {
-            std::cerr << "[gdr_copy] poll_cq timeout after " << MAX_POLL_US << " µs\n";
-            return -1;
-        }
-    }
-    return 0;
+int GDRCopyChannelImpl::rdma_read(uint64_t local_host_va, uint32_t lkey,
+                                   uint64_t remote_gpu_va, uint32_t rkey,
+                                   size_t   bytes)
+{
+    return rdma_read_post(local_host_va, lkey, remote_gpu_va, rkey, bytes,
+                          submit_wr_id_);
 }
 
 // ── H2D ──────────────────────────────────────────────────────────────────────
 int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes)
 {
     if (!gdr_ok_) {
-        // Fallback
-        cudaError_t ce = cudaMemcpy(dst_gpu, src_host, bytes,
-                                    cudaMemcpyHostToDevice);
-        stats_.fallback_ops++;
+        cudaError_t ce = cudaMemcpyAsync(dst_gpu, src_host, bytes,
+                                         cudaMemcpyHostToDevice, 0);
         return (ce == cudaSuccess) ? 0 : -1;
     }
 
     // Get / register GPU MR
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)dst_gpu, bytes);
 
-    // Fast path: only for CUDA pinned host pointers.
-    // This avoids paying ibv_reg_mr on every call for pageable malloc buffers.
-    struct ibv_mr* host_mr = nullptr;
-    if (is_cuda_pinned_host_ptr(src_host))
-        host_mr = get_host_mr((uint64_t)src_host, bytes);
-    if (host_mr) {
-        const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
-        uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
-        size_t remaining = bytes;
-        size_t chunk_size = pool_->slot_size();
-
-        while (remaining > 0) {
-            size_t n = std::min(remaining, chunk_size);
-            int rc = rdma_write((uint64_t)dst8, gpu_mr->rkey,
-                                (uint64_t)src8, host_mr->lkey,
-                                n);
-            if (rc != 0) return -1;
-            src8      += n;
-            dst8      += n;
-            remaining -= n;
-        }
-        stats_.rdma_ops++;
-        return 0;
-    }
-
-    // Chunk through pinned pool
+    // Always register/find host MR first (works for pinned and pageable memory).
+    struct ibv_mr* host_mr = get_host_mr((uint64_t)src_host, bytes);
+    if (!host_mr) return -1;
     const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_host);
     uint8_t*       dst8 = reinterpret_cast<uint8_t*>(dst_gpu);
     size_t remaining = bytes;
@@ -528,23 +499,14 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
 
     while (remaining > 0) {
         size_t n = std::min(remaining, chunk_size);
-        PinnedSlot* slot = pool_->acquire();
-
-        // CPU copy: user src → pinned host (cache-coherent, fast)
-        ::memcpy(slot->host_ptr, src8, n);
-
-        // RDMA WRITE: pinned host → GPU (NIC DMA, no CPU involvement)
         int rc = rdma_write((uint64_t)dst8, gpu_mr->rkey,
-                            (uint64_t)slot->host_ptr, slot->mr->lkey,
+                            (uint64_t)src8, host_mr->lkey,
                             n);
-        pool_->release(slot);
         if (rc != 0) return -1;
-
         src8      += n;
         dst8      += n;
         remaining -= n;
     }
-    stats_.rdma_ops++;
     return 0;
 }
 
@@ -552,71 +514,41 @@ int GDRCopyChannelImpl::do_h2d(void* dst_gpu, const void* src_host, size_t bytes
 int GDRCopyChannelImpl::do_d2h(void* dst_host, const void* src_gpu, size_t bytes)
 {
     if (!gdr_ok_) {
-        cudaError_t ce = cudaMemcpy(dst_host, src_gpu, bytes,
-                                    cudaMemcpyDeviceToHost);
-        stats_.fallback_ops++;
+        cudaError_t ce = cudaMemcpyAsync(dst_host, src_gpu, bytes,
+                                         cudaMemcpyDeviceToHost, 0);
         return (ce == cudaSuccess) ? 0 : -1;
     }
 
     struct ibv_mr* gpu_mr = get_gpu_mr((uint64_t)src_gpu, bytes);
 
-    // Fast path: only for CUDA pinned host pointers.
-    struct ibv_mr* host_mr = nullptr;
-    if (is_cuda_pinned_host_ptr(dst_host))
-        host_mr = get_host_mr((uint64_t)dst_host, bytes);
-    if (host_mr) {
-        uint8_t* dst8       = reinterpret_cast<uint8_t*>(dst_host);
-        const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_gpu);
-        size_t remaining = bytes;
-        size_t chunk_size = pool_->slot_size();
-
-        while (remaining > 0) {
-            size_t n = std::min(remaining, chunk_size);
-            int rc = rdma_read((uint64_t)dst8, host_mr->lkey,
-                               (uint64_t)src8, gpu_mr->rkey,
-                               n);
-            if (rc != 0) return -1;
-            dst8      += n;
-            src8      += n;
-            remaining -= n;
-        }
-        stats_.rdma_ops++;
-        return 0;
-    }
-
-    uint8_t* dst8        = reinterpret_cast<uint8_t*>(dst_host);
-    const uint8_t* src8  = reinterpret_cast<const uint8_t*>(src_gpu);
+    // Always register/find host MR first (works for pinned and pageable memory).
+    struct ibv_mr* host_mr = get_host_mr((uint64_t)dst_host, bytes);
+    if (!host_mr) return -1;
+    uint8_t* dst8       = reinterpret_cast<uint8_t*>(dst_host);
+    const uint8_t* src8 = reinterpret_cast<const uint8_t*>(src_gpu);
     size_t remaining = bytes;
     size_t chunk_size = pool_->slot_size();
 
     while (remaining > 0) {
         size_t n = std::min(remaining, chunk_size);
-        PinnedSlot* slot = pool_->acquire();
-
-        // RDMA READ: GPU → pinned host
-        int rc = rdma_read((uint64_t)slot->host_ptr, slot->mr->lkey,
+        int rc = rdma_read((uint64_t)dst8, host_mr->lkey,
                            (uint64_t)src8, gpu_mr->rkey,
                            n);
-        if (rc != 0) { pool_->release(slot); return -1; }
-
-        // CPU copy: pinned host → user dst
-        ::memcpy(dst8, slot->host_ptr, n);
-        pool_->release(slot);
-
+        if (rc != 0) return -1;
         dst8      += n;
         src8      += n;
         remaining -= n;
     }
-    stats_.rdma_ops++;
     return 0;
+
+        // RDMA READ: GPU → pinned host
+        // CPU copy: pinned host → user dst
 }
 
 // ── D2D ──────────────────────────────────────────────────────────────────────
 int GDRCopyChannelImpl::do_d2d(void* dst_gpu, const void* src_gpu, size_t bytes) {
-    // Same-device D2D: cudaMemcpy is already optimal (uses CE copy engine).
-    cudaError_t ce = cudaMemcpy(dst_gpu, src_gpu, bytes,
-                                cudaMemcpyDeviceToDevice);
-    stats_.fallback_ops++;
+    cudaError_t ce = cudaMemcpyAsync(dst_gpu, src_gpu, bytes,
+                                     cudaMemcpyDeviceToDevice, 0);
     return (ce == cudaSuccess) ? 0 : -1;
 }
 
@@ -624,44 +556,114 @@ int GDRCopyChannelImpl::do_d2d(void* dst_gpu, const void* src_gpu, size_t bytes)
 int GDRCopyChannelImpl::memcpy(void* dst, const void* src,
                                 size_t bytes, GDRCopyKind kind)
 {
-    if (bytes == 0) return 0;
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    double t0 = now_us();
-    int rc = 0;
-
-    switch (kind) {
-        case GDR_H2D: rc = do_h2d(dst, src, bytes); break;
-        case GDR_D2H: rc = do_d2h(dst, src, bytes); break;
-        case GDR_D2D: rc = do_d2d(dst, src, bytes); break;
-        default:      return -EINVAL;
-    }
-
-    double lat = now_us() - t0;
-    stats_.last_latency_us = lat;
-    stats_.avg_latency_us  =
-        (stats_.avg_latency_us * stats_.total_ops + lat) /
-        (stats_.total_ops + 1);
-    stats_.total_bytes += bytes;
-    stats_.total_ops++;
-
-    return rc;
+    // Keep API compatibility, but make memcpy submit-only as well.
+    return memcpy_async(dst, src, bytes, kind);
 }
 
 // ── async (fire-and-forget, then sync) ───────────────────────────────────────
-// For simplicity the async path still acquires the lock and posts the WR
-// but does NOT poll the CQ — that is deferred to sync().
+// Submit-only path: this call only posts work requests.
+// Completion is checked by sync() in a non-blocking manner.
 // A production impl would use a dedicated completion thread.
 int GDRCopyChannelImpl::memcpy_async(void* dst, const void* src,
                                       size_t bytes, GDRCopyKind kind)
 {
-    // For now, serialize async as sync (safe, correct, simplifiable later)
-    return memcpy(dst, src, bytes, kind);
+    if (bytes == 0) return 0;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (async_op_.in_flight) return -EBUSY;
+
+    double t0 = now_us();
+
+    uint64_t wr_id = next_wr_id_++;
+    submit_wr_id_ = wr_id;
+
+    int rc = 0;
+    try {
+        switch (kind) {
+            case GDR_H2D: rc = do_h2d(dst, src, bytes); break;
+            case GDR_D2H: rc = do_d2h(dst, src, bytes); break;
+            case GDR_D2D: rc = do_d2d(dst, src, bytes); break;
+            default:
+                submit_wr_id_ = 0;
+                return -EINVAL;
+        }
+    } catch (...) {
+        submit_wr_id_ = 0;
+        throw;
+    }
+    submit_wr_id_ = 0;
+    if (rc != 0) return rc;
+
+    bool is_rdma = gdr_ok_ && (kind == GDR_H2D || kind == GDR_D2H);
+    int pending_wcs = 0;
+    if (is_rdma) {
+        size_t chunk_size = pool_->slot_size();
+        pending_wcs = static_cast<int>((bytes + chunk_size - 1) / chunk_size);
+    }
+
+    async_op_.dst = dst;
+    async_op_.bytes = bytes;
+    async_op_.kind = kind;
+    async_op_.pending_wcs = pending_wcs;
+    async_op_.is_rdma = is_rdma;
+    async_op_.wr_id = is_rdma ? wr_id : 0;
+    async_op_.t_submit_us = t0;
+    async_op_.in_flight = true;
+    return 0;
 }
 
 int GDRCopyChannelImpl::sync() {
-    // No-op: async is currently serialized in memcpy_async
-    return 0;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!async_op_.in_flight) return 0;
+
+    // Non-blocking sync: drain at most one completion and return.
+    // This keeps submit latency path free from completion waits.
+    int rc = 0;
+    if (async_op_.is_rdma) {
+        struct ibv_wc wc{};
+        int n = ibv_poll_cq(cq_, 1, &wc);
+        if (n < 0) {
+            rc = -1;
+        } else if (n == 0) {
+            return -EAGAIN;
+        } else if (n == 1 && wc.status != IBV_WC_SUCCESS) {
+            std::cerr << "[gdr_copy] WC error: " << ibv_wc_status_str(wc.status)
+                      << " (" << wc.status << ")\n";
+            rc = -1;
+        } else if (n == 1 && wc.wr_id != async_op_.wr_id) {
+            std::cerr << "[gdr_copy] WC wr_id mismatch: got " << wc.wr_id
+                      << ", expected " << async_op_.wr_id << "\n";
+            rc = -1;
+        } else if (n == 1) {
+            async_op_.pending_wcs--;
+            if (async_op_.pending_wcs > 0) return -EAGAIN;
+        }
+    } else {
+        // CUDA fallback path: query default stream without blocking.
+        cudaError_t ce = cudaStreamQuery(0);
+        if (ce == cudaErrorNotReady) {
+            (void)cudaGetLastError();
+            return -EAGAIN;
+        }
+        if (ce != cudaSuccess) {
+            rc = -1;
+        }
+    }
+
+    double lat = now_us() - async_op_.t_submit_us;
+
+    stats_.last_latency_us = lat;
+    stats_.avg_latency_us  =
+        (stats_.avg_latency_us * stats_.total_ops + lat) /
+        (stats_.total_ops + 1);
+    stats_.total_bytes += async_op_.bytes;
+    stats_.total_ops++;
+    if (rc == 0) {
+        if (async_op_.is_rdma) stats_.rdma_ops++;
+        else                   stats_.fallback_ops++;
+    }
+
+    async_op_ = {};
+    return rc;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

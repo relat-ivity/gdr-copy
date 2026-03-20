@@ -69,30 +69,29 @@ public:
     virtual ~GDRCopyChannel() = default;
 
     /**
-     * memcpy — primary API, mirrors cudaMemcpy signature.
+     * memcpy — submit-only API (same submit semantics as memcpy_async).
      *
      * @param dst   destination pointer (GPU VA for H2D, host ptr for D2H)
      * @param src   source pointer
      * @param bytes number of bytes to transfer
      * @param kind  GDR_H2D / GDR_D2H / GDR_D2D
-     * @return      0 on success, negative errno-style on failure
-     *
-     * Thread safety: each channel is protected by an internal mutex;
-     * concurrent calls are serialised but not parallelised. Create multiple
-     * channels for parallel streams.
+     * @return      0 on successful submission, negative errno-style on failure
      */
     virtual int memcpy(void* dst, const void* src,
                        size_t bytes, GDRCopyKind kind) = 0;
 
     /**
      * memcpy_async — post the transfer and return immediately.
-     * Call sync() to wait for completion.
+     * Call sync() repeatedly until it returns 0.
      * Only one async operation may be in-flight per channel.
      */
     virtual int memcpy_async(void* dst, const void* src,
                              size_t bytes, GDRCopyKind kind) = 0;
 
-    /** Wait for the last memcpy_async to finish. */
+    /**
+     * Non-blocking progress check for the last memcpy_async.
+     * Returns 0 when completed, -EAGAIN when still in flight.
+     */
     virtual int sync() = 0;
 
     /** Return accumulated statistics. */
