@@ -2,17 +2,17 @@
  * bench.cpp  —  GDR Copy vs cudaMemcpy async timing benchmark
  *
  * Usage:
- *   sudo ./build/bench [gpu_id] [nic_name] [pipeline_depth]
+ *   sudo ./build/bench [gpu_id] [nic_name] [parallel_reqs]
  *   sudo ./build/bench 0 mlx5_0
- *   sudo ./build/bench 0 mlx5_0 16
+ *   sudo ./build/bench 0 mlx5_0 8
  *
  * Output:
  *   For each transfer size × direction, prints:
  *     - submit (issue) latency
- *     - transfer service latency (queue-excluded per request)
+ *     - transfer latency (request submit-done -> completion observed)
  *     - median latency (µs)
  *     - p99 latency (µs)
- *     - GB/s only for transfer/service tables
+ *     - GB/s only for transfer tables
  *   for both GDR RDMA path and cudaMemcpyAsync baseline.
  *
  * Why sudo?
@@ -26,7 +26,6 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cerrno>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,12 +33,10 @@
 #include <vector>
 #include <chrono>
 #include <numeric>
-#include <deque>
 #include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <atomic>
 
 // ── timing ────────────────────────────────────────────────────────────────────
 static double now_us() {
@@ -77,293 +74,334 @@ static BenchResult analyse(std::vector<double>& samples, size_t bytes) {
     return r;
 }
 
-struct GdrCompletion {
+struct ReqKey {
+    size_t lane = 0;
     uint64_t req_id = 0;
-    double observed_us = 0.0;
+    bool operator==(const ReqKey& o) const {
+        return lane == o.lane && req_id == o.req_id;
+    }
 };
 
-class GlobalGdrCqPoller {
+struct ReqKeyHash {
+    size_t operator()(const ReqKey& k) const {
+        size_t h1 = std::hash<size_t>{}(k.lane);
+        size_t h2 = std::hash<uint64_t>{}(k.req_id);
+        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
+
+struct GdrRunState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<double> transfer_samples;
+    std::vector<size_t> completed_lanes;
+    int completed = 0;
+    int fatal_rc = 0;
+    double measure_end_us = -1.0;
+};
+
+// One global CQ polling thread; it polls all channel CQs and handles completion.
+class GdrCqListener {
 public:
-    explicit GlobalGdrCqPoller(const std::shared_ptr<GDRCopyChannel>& ch)
-        : ch_(ch) {
-        worker_ = std::thread([this]() { run(); });
+    explicit GdrCqListener(std::vector<std::shared_ptr<GDRCopyChannel>> channels)
+        : channels_(std::move(channels)), th_([this]() { this->loop(); }) {}
+
+    ~GdrCqListener() { stop(); }
+
+    int register_request(size_t lane, uint64_t req_id,
+                         GdrRunState& run,
+                         double submit_done_us,
+                         bool record,
+                         int expected_wcs)
+    {
+        if (lane >= channels_.size()) return -EINVAL;
+        if (expected_wcs <= 0) expected_wcs = 1;
+
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (stop_) return -ESHUTDOWN;
+        if (listener_rc_ != 0) return listener_rc_;
+
+        ReqKey key{lane, req_id};
+        if (pending_.find(key) != pending_.end()) return -EEXIST;
+
+        int early = 0;
+        auto eit = early_wc_.find(key);
+        if (eit != early_wc_.end()) {
+            early = eit->second;
+            early_wc_.erase(eit);
+        }
+
+        PendingReq req{};
+        req.run = &run;
+        req.lane = lane;
+        req.submit_done_us = submit_done_us;
+        req.record = record;
+        req.remaining_wcs = expected_wcs - early;
+        if (req.remaining_wcs <= 0) {
+            ready_.push_back(req);
+        } else {
+            pending_[key] = req;
+        }
+        return 0;
     }
 
-    ~GlobalGdrCqPoller() {
-        stop();
+    int wait_until_completed(GdrRunState& run, int target_completed) {
+        std::unique_lock<std::mutex> lk(run.mtx);
+        run.cv.wait(lk, [&]() {
+            return run.fatal_rc != 0 ||
+                   run.completed >= target_completed;
+        });
+        return run.fatal_rc;
     }
 
     void stop() {
-        bool expected = false;
-        if (!stopped_.compare_exchange_strong(expected, true,
-                                              std::memory_order_relaxed)) {
-            return;
-        }
-        stop_flag_.store(true, std::memory_order_relaxed);
-        if (worker_.joinable()) worker_.join();
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            stopped_done_ = true;
+            if (stop_) return;
+            stop_ = true;
         }
-        cv_.notify_all();
-    }
-
-    int fatal_rc() const {
-        return fatal_rc_.load(std::memory_order_relaxed);
-    }
-
-    bool try_pop(GdrCompletion* out) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (q_.empty()) return false;
-        *out = q_.front();
-        q_.pop_front();
-        return true;
-    }
-
-    int wait_pop(GdrCompletion* out) {
-        std::unique_lock<std::mutex> lk(mtx_);
-        cv_.wait(lk, [&]() {
-            return fatal_rc_.load(std::memory_order_relaxed) != 0 ||
-                   !q_.empty() ||
-                   stopped_done_;
-        });
-        if (!q_.empty()) {
-            *out = q_.front();
-            q_.pop_front();
-            return 0;
-        }
-        int frc = fatal_rc_.load(std::memory_order_relaxed);
-        if (frc != 0) return frc;
-        return -EAGAIN;
+        if (th_.joinable()) th_.join();
     }
 
 private:
-    void run() {
-        while (!stop_flag_.load(std::memory_order_relaxed)) {
-            uint64_t req_id = 0;
-            int rc = ch_->poll_wc(&req_id);
-            if (rc == -EAGAIN) {
-                std::this_thread::yield();
-                continue;
+    struct PendingReq {
+        GdrRunState* run = nullptr;
+        size_t lane = 0;
+        double submit_done_us = 0.0;
+        bool record = false;
+        int remaining_wcs = 0;
+    };
+
+    void complete_req(const PendingReq& req, double done_us) {
+        if (!req.run) return;
+        {
+            std::lock_guard<std::mutex> run_lk(req.run->mtx);
+            if (req.record) {
+                req.run->transfer_samples.push_back(done_us - req.submit_done_us);
+                req.run->measure_end_us = done_us;
             }
-            if (rc != 0) {
-                fatal_rc_.store(rc, std::memory_order_relaxed);
-                cv_.notify_all();
-                return;
+            req.run->completed++;
+            req.run->completed_lanes.push_back(req.lane);
+        }
+        req.run->cv.notify_all();
+    }
+
+    void mark_all_failed(int rc) {
+        std::vector<GdrRunState*> runs;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (listener_rc_ == 0) listener_rc_ = rc;
+            runs.reserve(pending_.size() + ready_.size());
+            for (const auto& kv : pending_) {
+                if (kv.second.run) runs.push_back(kv.second.run);
             }
-            GdrCompletion c{req_id, now_us()};
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                q_.push_back(c);
+            for (const auto& req : ready_) {
+                if (req.run) runs.push_back(req.run);
             }
-            cv_.notify_all();
+        }
+        for (GdrRunState* run : runs) {
+            std::lock_guard<std::mutex> run_lk(run->mtx);
+            if (run->fatal_rc == 0) run->fatal_rc = rc;
+            run->cv.notify_all();
         }
     }
 
-    std::shared_ptr<GDRCopyChannel> ch_;
-    std::thread worker_;
-    std::deque<GdrCompletion> q_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    std::atomic<int> fatal_rc_{0};
-    std::atomic<bool> stop_flag_{false};
-    std::atomic<bool> stopped_{false};
-    bool stopped_done_ = false;
+    bool pop_ready(PendingReq* out) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (ready_.empty()) return false;
+        *out = ready_.back();
+        ready_.pop_back();
+        return true;
+    }
+
+    void loop() {
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (stop_) return;
+            }
+
+            PendingReq ready_req{};
+            if (pop_ready(&ready_req)) {
+                complete_req(ready_req, now_us());
+                continue;
+            }
+
+            bool progressed = false;
+            for (size_t lane = 0; lane < channels_.size(); ++lane) {
+                uint64_t req_id = 0;
+                int rc = channels_[lane]->poll_wc(&req_id);
+                if (rc == -EAGAIN) continue;
+                if (rc != 0) {
+                    mark_all_failed(rc);
+                    return;
+                }
+
+                progressed = true;
+                const double done_us = now_us();
+                ReqKey key{lane, req_id};
+                PendingReq req{};
+                bool done = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    auto it = pending_.find(key);
+                    if (it == pending_.end()) {
+                        early_wc_[key]++;
+                    } else {
+                        it->second.remaining_wcs--;
+                        if (it->second.remaining_wcs <= 0) {
+                            req = it->second;
+                            pending_.erase(it);
+                            done = true;
+                        }
+                    }
+                }
+                if (done) complete_req(req, done_us);
+            }
+
+            if (!progressed) std::this_thread::yield();
+        }
+    }
+
+    std::vector<std::shared_ptr<GDRCopyChannel>> channels_;
+    mutable std::mutex mtx_;
+    std::unordered_map<ReqKey, PendingReq, ReqKeyHash> pending_;
+    std::unordered_map<ReqKey, int, ReqKeyHash> early_wc_;
+    std::vector<PendingReq> ready_;
+    bool stop_ = false;
+    int listener_rc_ = 0;
+    std::thread th_;
 };
 
-// Measure request-level latency:
-// transfer sample uses queue-excluded service time approximation on one channel:
-//   service = completion_time - max(submit_done_time, previous_completed_time).
-static BenchPair run_gdr_timings(std::shared_ptr<GDRCopyChannel> ch,
-                                 GlobalGdrCqPoller& cq_poller,
-                                 const std::vector<void*>& dst_slots,
-                                 const std::vector<void*>& src_slots,
-                                 size_t bytes, GDRCopyKind kind,
-                                 int warmup, int iters)
+// Main thread: submit + record submit_done time only.
+// CQ thread: poll all CQs, match (lane, req_id), and record transfer timing.
+static BenchPair run_gdr_timings(
+    const std::vector<std::shared_ptr<GDRCopyChannel>>& channels,
+    GdrCqListener& cq_listener,
+    const std::vector<void*>& dst_lanes,
+    const std::vector<void*>& src_lanes,
+    size_t bytes, GDRCopyKind kind,
+    int warmup, int iters)
 {
-    const int depth = (int)dst_slots.size();
-    if (depth <= 0 || src_slots.size() != dst_slots.size()) {
-        fprintf(stderr, "[issue] invalid slot setup: dst=%zu src=%zu\n",
-                dst_slots.size(), src_slots.size());
+    const size_t lanes = channels.size();
+    if (lanes == 0 || dst_lanes.size() != lanes || src_lanes.size() != lanes) {
+        fprintf(stderr, "[issue] invalid gdr lane setup: channels=%zu dst=%zu src=%zu\n",
+                channels.size(), dst_lanes.size(), src_lanes.size());
         std::exit(2);
     }
 
     std::vector<double> issue_samples;
-    std::vector<double> transfer_samples;
     issue_samples.reserve(iters);
-    transfer_samples.reserve(iters);
-    std::vector<char> slot_busy((size_t)depth, 0);
-    struct PendingReq {
-        double submit_done_us = 0.0;
-        bool record = false;
-        int slot = -1;
-        int remaining_wcs = 0;
-    };
-    struct EarlyWc {
-        int count = 0;
-        double last_seen_us = 0.0;
-    };
-    std::unordered_map<uint64_t, PendingReq> pending;
-    pending.reserve((size_t)(warmup + iters) * 2);
-    std::unordered_map<uint64_t, EarlyWc> early_wcs;
-    early_wcs.reserve((size_t)(warmup + iters) * 2);
+    GdrRunState run{};
+    run.transfer_samples.reserve(iters);
+    run.completed_lanes.reserve((size_t)(warmup + iters));
 
     const int total = warmup + iters;
-    int issued = 0;
-    int completed = 0;
-    int next_slot_hint = 0;
     double measure_begin_us = -1.0;
-    double measure_end_us = -1.0;
-    double service_tail_us = -1.0;
-    int fatal_rc = 0;
 
-    auto pick_free_slot = [&]() -> int {
-        for (int probe = 0; probe < depth; ++probe) {
-            int cand = (next_slot_hint + probe) % depth;
-            if (!slot_busy[(size_t)cand]) {
-                next_slot_hint = (cand + 1) % depth;
-                return cand;
-            }
+    // Lane state in main thread: one lane can carry at most one in-flight request.
+    // A lane becomes available only after CQ thread reports completion for that lane.
+    std::vector<char> lane_busy(lanes, 0);
+
+    // Reclaim completed lanes from CQ thread notifications.
+    auto reclaim_completed_lanes = [&]() -> int {
+        std::lock_guard<std::mutex> lk(run.mtx);
+        if (run.fatal_rc != 0) return run.fatal_rc;
+        for (size_t lane : run.completed_lanes) {
+            if (lane < lane_busy.size()) lane_busy[lane] = 0;
         }
-        return -1;
+        run.completed_lanes.clear();
+        return 0;
     };
 
-    auto finalize_req = [&](const PendingReq& req, double done_us) {
-        slot_busy[(size_t)req.slot] = 0;
-        if (req.record) {
-            double service_start = req.submit_done_us;
-            if (service_tail_us > service_start) service_start = service_tail_us;
-            double service_us = done_us - service_start;
-            if (service_us < 0.0) service_us = 0.0;
-            transfer_samples.push_back(service_us);
-            measure_end_us = done_us;
-        }
-        if (done_us > service_tail_us) service_tail_us = done_us;
-        completed++;
-    };
-
-    auto on_completion = [&](uint64_t req_id, double done_us) {
-        auto it = pending.find(req_id);
-        if (it == pending.end()) {
-            EarlyWc& ew = early_wcs[req_id];
-            ew.count += 1;
-            ew.last_seen_us = done_us;
-            return;
-        }
-
-        PendingReq& req = it->second;
-        req.remaining_wcs--;
-        if (req.remaining_wcs <= 0) {
-            PendingReq done_req = req;
-            pending.erase(it);
-            finalize_req(done_req, done_us);
-        }
-    };
-
+    int issued = 0;
+    size_t rr_lane = 0;
     while (issued < total) {
-        int frc = cq_poller.fatal_rc();
+        int frc = reclaim_completed_lanes();
         if (frc != 0) {
-            fatal_rc = frc;
-            break;
+            fprintf(stderr, "[issue] gdr completion failed: rc=%d kind=%d bytes=%zu\n",
+                    frc, (int)kind, bytes);
+            std::exit(2);
         }
 
-        GdrCompletion c{};
-        while (cq_poller.try_pop(&c)) {
-            on_completion(c.req_id, c.observed_us);
-        }
-
-        int slot = pick_free_slot();
-        if (slot < 0) {
-            int wrc = cq_poller.wait_pop(&c);
-            if (wrc == 0) {
-                on_completion(c.req_id, c.observed_us);
-                continue;
+        // Pick next free lane in round-robin order to avoid lane starvation.
+        size_t lane = lanes;
+        for (size_t probe = 0; probe < lanes; ++probe) {
+            const size_t cand = (rr_lane + probe) % lanes;
+            if (!lane_busy[cand]) {
+                lane = cand;
+                rr_lane = (cand + 1) % lanes;
+                break;
             }
-            if (wrc == -EAGAIN) continue;
-            fatal_rc = wrc;
-            break;
         }
-        slot_busy[(size_t)slot] = 1;
+        if (lane == lanes) {
+            // All lanes busy: wait until CQ thread returns at least one completion.
+            std::unique_lock<std::mutex> lk(run.mtx);
+            run.cv.wait(lk, [&]() {
+                return run.fatal_rc != 0 || !run.completed_lanes.empty();
+            });
+            continue;
+        }
 
-        double t0 = now_us();
+        lane_busy[lane] = 1;
+        const double t0 = now_us();
         uint64_t req_id = 0;
         int expected_wcs = 0;
-        int rc = ch->memcpy_async_tagged(dst_slots[(size_t)slot], src_slots[(size_t)slot], bytes, kind,
-                                         &req_id, &expected_wcs);
-        double t1 = now_us();
+        int rc = channels[lane]->memcpy_async_tagged(
+            dst_lanes[lane], src_lanes[lane], bytes, kind, &req_id, &expected_wcs);
+        const double t1 = now_us();
 
         if (rc == -EBUSY) {
-            slot_busy[(size_t)slot] = 0;
-            int wrc = cq_poller.wait_pop(&c);
-            if (wrc == 0) {
-                on_completion(c.req_id, c.observed_us);
-                continue;
-            }
-            if (wrc == -EAGAIN) continue;
-            fatal_rc = wrc;
-            break;
+            lane_busy[lane] = 0;
+            std::this_thread::yield();
+            continue;
         }
         if (rc != 0) {
-            slot_busy[(size_t)slot] = 0;
-            fatal_rc = rc;
-            break;
+            fprintf(stderr, "[issue] gdr submit failed: rc=%d lane=%zu kind=%d bytes=%zu\n",
+                    rc, lane, (int)kind, bytes);
+            std::exit(2);
         }
 
         const bool record = (issued >= warmup);
-        if (record) issue_samples.push_back(t1 - t0);
-        if (record && measure_begin_us < 0.0) measure_begin_us = t1;
-        if (expected_wcs <= 0) expected_wcs = 1;
+        if (record) {
+            // Issue latency: submit call return time minus submit start time.
+            issue_samples.push_back(t1 - t0);
+            if (measure_begin_us < 0.0) measure_begin_us = t1;
+        }
 
-        PendingReq req{t1, record, slot, expected_wcs};
-        auto ew = early_wcs.find(req_id);
-        if (ew != early_wcs.end()) {
-            req.remaining_wcs -= ew->second.count;
-            double done_us = ew->second.last_seen_us;
-            early_wcs.erase(ew);
-            if (req.remaining_wcs <= 0) {
-                finalize_req(req, done_us);
-            } else {
-                pending[req_id] = req;
-            }
-        } else {
-            pending[req_id] = req;
+        // Register (lane, req_id) so CQ thread can map WC -> request timing.
+        rc = cq_listener.register_request(lane, req_id, run, t1, record, expected_wcs);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "[issue] gdr register failed: rc=%d lane=%zu kind=%d bytes=%zu req_id=%llu\n",
+                    rc, lane, (int)kind, bytes, (unsigned long long)req_id);
+            std::exit(2);
         }
 
         issued++;
     }
 
-    GdrCompletion c{};
-    while (fatal_rc == 0 && completed < issued) {
-        while (cq_poller.try_pop(&c)) {
-            on_completion(c.req_id, c.observed_us);
-        }
-        if (completed >= issued) break;
-        int wrc = cq_poller.wait_pop(&c);
-        if (wrc == 0) {
-            on_completion(c.req_id, c.observed_us);
-            continue;
-        }
-        if (wrc == -EAGAIN) continue;
-        fatal_rc = wrc;
-        break;
+    // Wait until all submitted requests are completed by CQ thread.
+    int rc = cq_listener.wait_until_completed(run, total);
+    if (rc != 0) {
+        fprintf(stderr, "[issue] gdr completion failed: rc=%d kind=%d bytes=%zu\n",
+                rc, (int)kind, bytes);
+        std::exit(2);
     }
 
-    if (fatal_rc != 0) {
-        fprintf(stderr, "[issue] gdr pipeline failed: rc=%d kind=%d bytes=%zu\n",
-                fatal_rc, (int)kind, bytes);
-        std::exit(2);
-    }
-    if (issued != total || completed != total) {
-        fprintf(stderr,
-                "[issue] gdr pipeline count mismatch: issued=%d completed=%d total=%d kind=%d bytes=%zu\n",
-                issued, completed, total, (int)kind, bytes);
-        std::exit(2);
+    std::vector<double> transfer_samples;
+    double measure_end_us = -1.0;
+    {
+        std::lock_guard<std::mutex> lk(run.mtx);
+        transfer_samples = run.transfer_samples;
+        measure_end_us = run.measure_end_us;
     }
 
     BenchPair out{};
     out.issue = analyse(issue_samples, bytes);
     out.transfer = analyse(transfer_samples, bytes);
     if (measure_begin_us > 0.0 && measure_end_us > measure_begin_us) {
+        // Throughput window: first measured submit-done -> last measured completion.
         const double span_us = measure_end_us - measure_begin_us;
         out.transfer.bw_GBs = ((double)bytes * (double)iters / 1e9) / (span_us / 1e6);
     }
@@ -414,15 +452,17 @@ static void print_latency_table(const char* title,
     }
 }
 
-static BenchPair run_cuda_timings(const std::vector<void*>& dst_slots,
-                                  const std::vector<void*>& src_slots,
-                                  size_t bytes, cudaMemcpyKind kind,
-                                  int warmup, int iters, cudaStream_t stream)
+static BenchPair run_cuda_timings(
+    const std::vector<void*>& dst_lanes,
+    const std::vector<void*>& src_lanes,
+    size_t bytes, cudaMemcpyKind kind,
+    int warmup, int iters,
+    const std::vector<cudaStream_t>& streams)
 {
-    const int depth = (int)dst_slots.size();
-    if (depth <= 0 || src_slots.size() != dst_slots.size()) {
-        fprintf(stderr, "[issue] invalid CUDA slot setup: dst=%zu src=%zu\n",
-                dst_slots.size(), src_slots.size());
+    const size_t lanes = dst_lanes.size();
+    if (lanes == 0 || src_lanes.size() != lanes || streams.size() != lanes) {
+        fprintf(stderr, "[issue] invalid cuda lane setup: dst=%zu src=%zu streams=%zu\n",
+                dst_lanes.size(), src_lanes.size(), streams.size());
         std::exit(2);
     }
 
@@ -430,215 +470,180 @@ static BenchPair run_cuda_timings(const std::vector<void*>& dst_slots,
     std::vector<double> transfer_samples;
     issue_samples.reserve(iters);
     transfer_samples.reserve(iters);
-    std::vector<char> slot_busy((size_t)depth, 0);
-    std::vector<cudaEvent_t> slot_start_events((size_t)depth, nullptr);
-    std::vector<cudaEvent_t> slot_done_events((size_t)depth, nullptr);
-    for (int s = 0; s < depth; ++s) {
-        cudaError_t ce = cudaEventCreate(&slot_start_events[(size_t)s]);
+
+    // One completion event per lane; each lane keeps one in-flight request.
+    std::vector<cudaEvent_t> done_events(lanes, nullptr);
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        cudaError_t ce = cudaEventCreateWithFlags(&done_events[lane], cudaEventDisableTiming);
         if (ce != cudaSuccess) {
-            fprintf(stderr, "[issue] cudaEventCreate(start) failed: slot=%d err=%s\n",
-                    s, cudaGetErrorString(ce));
-            std::exit(2);
-        }
-        ce = cudaEventCreate(&slot_done_events[(size_t)s]);
-        if (ce != cudaSuccess) {
-            fprintf(stderr, "[issue] cudaEventCreate(done) failed: slot=%d err=%s\n",
-                    s, cudaGetErrorString(ce));
+            fprintf(stderr, "[issue] cudaEventCreate failed: lane=%zu err=%s\n",
+                    lane, cudaGetErrorString(ce));
             std::exit(2);
         }
     }
-    struct PendingCudaReq {
+
+    struct LanePending {
+        bool active = false;
         double submit_done_us = 0.0;
         bool record = false;
-        int slot = -1;
     };
-    std::unordered_map<uint64_t, PendingCudaReq> pending;
-    pending.reserve((size_t)(warmup + iters) * 2);
-    uint64_t next_req_id = 1;
+
     const int total = warmup + iters;
-    int issued = 0;
-    int next_slot_hint = 0;
     double measure_begin_us = -1.0;
     double measure_end_us = -1.0;
+
     std::mutex mtx;
     std::condition_variable cv;
-    std::atomic<int> completed{0};
-    std::atomic<int> fatal_rc{0};
+    std::vector<LanePending> pending(lanes);
+    std::vector<size_t> completed_lanes;
+    completed_lanes.reserve((size_t)total);
+    std::vector<char> lane_busy(lanes, 0);
 
-    auto has_free_slot = [&]() -> bool {
-        for (int i = 0; i < depth; ++i) {
-            if (!slot_busy[(size_t)i]) return true;
-        }
-        return false;
-    };
+    int completed = 0;
+    int fatal_rc = 0;
+    bool stop_collector = false;
 
-    auto pick_free_slot = [&]() -> int {
-        for (int probe = 0; probe < depth; ++probe) {
-            int cand = (next_slot_hint + probe) % depth;
-            if (!slot_busy[(size_t)cand]) {
-                next_slot_hint = (cand + 1) % depth;
-                return cand;
-            }
-        }
-        return -1;
-    };
-
-    std::thread cq_thread([&]() {
-        while (completed.load(std::memory_order_relaxed) < total &&
-               fatal_rc.load(std::memory_order_relaxed) == 0) {
-            std::vector<std::pair<uint64_t, int>> snapshot;
+    std::thread collector([&]() {
+        while (true) {
             {
                 std::lock_guard<std::mutex> lk(mtx);
-                snapshot.reserve(pending.size());
-                for (const auto& kv : pending) {
-                    snapshot.push_back({kv.first, kv.second.slot});
-                }
-            }
-            if (snapshot.empty()) {
-                std::this_thread::yield();
-                continue;
+                if (stop_collector || fatal_rc != 0) return;
             }
 
-            uint64_t ready_req_id = 0;
-            cudaError_t ready_ce = cudaErrorNotReady;
-            for (const auto& item : snapshot) {
-                cudaError_t ce = cudaEventQuery(slot_done_events[(size_t)item.second]);
-                if (ce == cudaErrorNotReady) {
+            bool progressed = false;
+            for (size_t lane = 0; lane < lanes; ++lane) {
+                bool active = false;
+                double submit_done_us = 0.0;
+                bool record = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (pending[lane].active) {
+                        active = true;
+                        submit_done_us = pending[lane].submit_done_us;
+                        record = pending[lane].record;
+                    }
+                }
+                if (!active) continue;
+
+                // CUDA completion side: query lane event and finalize when ready.
+                cudaError_t q = cudaEventQuery(done_events[lane]);
+                if (q == cudaErrorNotReady) {
                     (void)cudaGetLastError();
                     continue;
                 }
-                if (ce != cudaSuccess) {
-                    fatal_rc.store((int)ce, std::memory_order_relaxed);
+                if (q != cudaSuccess) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (fatal_rc == 0) fatal_rc = (int)q;
                     cv.notify_all();
                     return;
                 }
-                ready_req_id = item.first;
-                ready_ce = ce;
-                break;
-            }
-            if (ready_ce == cudaErrorNotReady || ready_req_id == 0) {
-                std::this_thread::yield();
-                continue;
-            }
 
-            PendingCudaReq req{};
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                auto it = pending.find(ready_req_id);
-                if (it == pending.end()) continue;
-                req = it->second;
-                pending.erase(it);
-            }
-
-            double t2 = now_us();
-            if (req.record) {
-                float ms = 0.0f;
-                cudaError_t ce = cudaEventElapsedTime(&ms,
-                                                      slot_start_events[(size_t)req.slot],
-                                                      slot_done_events[(size_t)req.slot]);
-                if (ce != cudaSuccess) {
-                    {
-                        std::lock_guard<std::mutex> lk(mtx);
-                        slot_busy[(size_t)req.slot] = 0;
+                progressed = true;
+                const double done_us = now_us();
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (!pending[lane].active) continue;
+                    if (record) {
+                        // Transfer latency: submit-done -> event completion observed.
+                        transfer_samples.push_back(done_us - submit_done_us);
+                        measure_end_us = done_us;
                     }
-                    fatal_rc.store((int)ce, std::memory_order_relaxed);
-                    cv.notify_all();
-                    return;
+                    pending[lane].active = false;
+                    completed++;
+                    completed_lanes.push_back(lane);
                 }
-                transfer_samples.push_back((double)ms * 1000.0);
-                measure_end_us = t2;
+                cv.notify_all();
             }
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                slot_busy[(size_t)req.slot] = 0;
-            }
-            completed.fetch_add(1, std::memory_order_relaxed);
-            cv.notify_all();
+
+            if (!progressed) std::this_thread::yield();
         }
     });
 
-    while (issued < total) {
-        if (fatal_rc.load(std::memory_order_relaxed) != 0) break;
+    auto reclaim_completed_lanes = [&]() -> int {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (fatal_rc != 0) return fatal_rc;
+        for (size_t lane : completed_lanes) {
+            if (lane < lane_busy.size()) lane_busy[lane] = 0;
+        }
+        completed_lanes.clear();
+        return 0;
+    };
 
-        int slot = -1;
-        {
+    int issued = 0;
+    size_t rr_lane = 0;
+    while (issued < total) {
+        int frc = reclaim_completed_lanes();
+        if (frc != 0) break;
+
+        // Same scheduling policy as GDR path: round-robin across free lanes.
+        size_t lane = lanes;
+        for (size_t probe = 0; probe < lanes; ++probe) {
+            const size_t cand = (rr_lane + probe) % lanes;
+            if (!lane_busy[cand]) {
+                lane = cand;
+                rr_lane = (cand + 1) % lanes;
+                break;
+            }
+        }
+        if (lane == lanes) {
+            // All lanes are in-flight; wait until collector releases one.
             std::unique_lock<std::mutex> lk(mtx);
             cv.wait(lk, [&]() {
-                return fatal_rc.load(std::memory_order_relaxed) != 0 ||
-                       has_free_slot();
+                return fatal_rc != 0 || !completed_lanes.empty();
             });
-            if (fatal_rc.load(std::memory_order_relaxed) != 0) break;
-
-            slot = pick_free_slot();
-            if (slot < 0) continue;
-            slot_busy[(size_t)slot] = 1;  // reserve before submit
+            continue;
         }
 
-        cudaError_t ce = cudaEventRecord(slot_start_events[(size_t)slot], stream);
+        lane_busy[lane] = 1;
+        const double t0 = now_us();
+        cudaError_t ce = cudaMemcpyAsync(dst_lanes[lane], src_lanes[lane], bytes, kind, streams[lane]);
+        const double t1 = now_us();
         if (ce != cudaSuccess) {
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                slot_busy[(size_t)slot] = 0;
-            }
-            fatal_rc.store((int)ce, std::memory_order_relaxed);
+            lane_busy[lane] = 0;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (fatal_rc == 0) fatal_rc = (int)ce;
             cv.notify_all();
             break;
         }
-        double t0 = now_us();
-        ce = cudaMemcpyAsync(dst_slots[(size_t)slot], src_slots[(size_t)slot], bytes, kind, stream);
-        double t1 = now_us();
+        ce = cudaEventRecord(done_events[lane], streams[lane]);
         if (ce != cudaSuccess) {
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                slot_busy[(size_t)slot] = 0;
-            }
-            fatal_rc.store((int)ce, std::memory_order_relaxed);
-            cv.notify_all();
-            break;
-        }
-        ce = cudaEventRecord(slot_done_events[(size_t)slot], stream);
-        if (ce != cudaSuccess) {
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                slot_busy[(size_t)slot] = 0;
-            }
-            fatal_rc.store((int)ce, std::memory_order_relaxed);
+            lane_busy[lane] = 0;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (fatal_rc == 0) fatal_rc = (int)ce;
             cv.notify_all();
             break;
         }
 
         const bool record = (issued >= warmup);
-        if (record) issue_samples.push_back(t1 - t0);
-        if (record && measure_begin_us < 0.0) measure_begin_us = t1;
-        uint64_t req_id = next_req_id++;
+        if (record) {
+            // Issue latency: cudaMemcpyAsync call return time.
+            issue_samples.push_back(t1 - t0);
+            if (measure_begin_us < 0.0) measure_begin_us = t1;
+        }
+
         {
             std::lock_guard<std::mutex> lk(mtx);
-            pending[req_id] = PendingCudaReq{t1, record, slot};
+            pending[lane].active = true;
+            pending[lane].submit_done_us = t1;
+            pending[lane].record = record;
         }
-        ++issued;
+        issued++;
     }
 
     {
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [&]() {
-            return fatal_rc.load(std::memory_order_relaxed) != 0 ||
-                   completed.load(std::memory_order_relaxed) >= total;
-        });
+        cv.wait(lk, [&]() { return fatal_rc != 0 || completed >= issued; });
+        stop_collector = true;
+        cv.notify_all();
+    }
+    if (collector.joinable()) collector.join();
+    for (auto& evt : done_events) {
+        if (evt) cudaEventDestroy(evt);
     }
 
-    if (cq_thread.joinable()) cq_thread.join();
-
-    for (auto& evt : slot_start_events) {
-        cudaEventDestroy(evt);
-    }
-    for (auto& evt : slot_done_events) {
-        cudaEventDestroy(evt);
-    }
-
-    int frc = fatal_rc.load(std::memory_order_relaxed);
-    if (frc != 0) {
+    if (fatal_rc != 0) {
         fprintf(stderr, "[issue] cuda pipeline failed: rc=%d(%s) bytes=%zu\n",
-                frc, cudaGetErrorString((cudaError_t)frc), bytes);
+                fatal_rc, cudaGetErrorString((cudaError_t)fatal_rc), bytes);
         std::exit(2);
     }
 
@@ -646,8 +651,36 @@ static BenchPair run_cuda_timings(const std::vector<void*>& dst_slots,
     out.issue = analyse(issue_samples, bytes);
     out.transfer = analyse(transfer_samples, bytes);
     if (measure_begin_us > 0.0 && measure_end_us > measure_begin_us) {
+        // Throughput window aligned with GDR path for fair comparison.
         const double span_us = measure_end_us - measure_begin_us;
         out.transfer.bw_GBs = ((double)bytes * (double)iters / 1e9) / (span_us / 1e6);
+    }
+    return out;
+}
+
+static std::vector<std::shared_ptr<GDRCopyChannel>>
+open_parallel_channels(int gpu_id, const std::string& nic_name, int lanes) {
+    std::vector<std::shared_ptr<GDRCopyChannel>> channels;
+    channels.reserve((size_t)lanes);
+
+    GDRCopyLib::shutdown();
+    for (int i = 0; i < lanes; ++i) {
+        auto ch = GDRCopyLib::open(gpu_id, nic_name);
+        channels.push_back(ch);
+        // Clear global cache so next open() creates another independent channel/QP.
+        GDRCopyLib::shutdown();
+    }
+    return channels;
+}
+
+static GDRStats aggregate_stats(const std::vector<std::shared_ptr<GDRCopyChannel>>& channels) {
+    GDRStats out{};
+    for (const auto& ch : channels) {
+        GDRStats s = ch->stats();
+        out.total_bytes  += s.total_bytes;
+        out.total_ops    += s.total_ops;
+        out.rdma_ops     += s.rdma_ops;
+        out.fallback_ops += s.fallback_ops;
     }
     return out;
 }
@@ -656,9 +689,9 @@ static BenchPair run_cuda_timings(const std::vector<void*>& dst_slots,
 int main(int argc, char** argv)
 {
     int         gpu_id   = (argc > 1) ? std::atoi(argv[1]) : 0;
-    std::string  nic_name = (argc > 2) ? argv[2]            : "mlx5_0";
-    int pipeline_depth    = (argc > 3) ? std::atoi(argv[3]) : 16;
-    if (pipeline_depth < 1) pipeline_depth = 1;
+    std::string nic_name = (argc > 2) ? argv[2]            : "mlx5_0";
+    int parallel_reqs    = (argc > 3) ? std::atoi(argv[3]) : 1;
+    if (parallel_reqs < 1) parallel_reqs = 1;
 
     printf("=================================================================\n");
     printf("  GDR Copy Benchmark  —  GPU %d  NIC %s\n", gpu_id, nic_name.c_str());
@@ -671,104 +704,118 @@ int main(int argc, char** argv)
     printf("GPU: %s  (PCIe gen%d x%d)\n\n",
            prop.name, prop.pciBusID, prop.pciDeviceID);
 
-    // ── Open GDR channel ──────────────────────────────────────────────────
-    std::shared_ptr<GDRCopyChannel> ch;
+    // ── Open N independent channels (one QP per channel) ─────────────────
+    std::vector<std::shared_ptr<GDRCopyChannel>> gdr_channels;
     try {
-        ch = GDRCopyLib::open(gpu_id, nic_name);
+        gdr_channels = open_parallel_channels(gpu_id, nic_name, parallel_reqs);
     } catch (const std::exception& e) {
-        fprintf(stderr, "Failed to open GDR channel: %s\n", e.what());
+        fprintf(stderr, "Failed to open GDR channels: %s\n", e.what());
+        return 1;
+    }
+    if (gdr_channels.empty()) {
+        fprintf(stderr, "Failed to create any GDR channel.\n");
         return 1;
     }
 
-    GDRStats s = ch->stats();
+    GDRStats s = gdr_channels[0]->stats();
     bool gdr_active = (s.fallback_ops == 0);
     printf("GPUDirect RDMA path: %s\n\n", gdr_active ? "ACTIVE" : "FALLBACK (cudaMemcpy)");
-    printf("Benchmark mode: pipelined issue + global CQ listener thread (wr_id match, depth=%d)\n\n",
-           pipeline_depth);
-    ch->reset_stats();
-    std::unique_ptr<GlobalGdrCqPoller> gdr_cq_poller =
-        std::make_unique<GlobalGdrCqPoller>(ch);
+    printf("Benchmark mode: fixed parallel in-flight (%d), one QP per lane, global CQ listener\n\n",
+           parallel_reqs);
+
+    for (auto& ch : gdr_channels) ch->reset_stats();
+    GdrCqListener gdr_cq_listener(gdr_channels);
 
     // ── Transfer sizes to sweep ───────────────────────────────────────────
     std::vector<size_t> sizes;
-    for (size_t s = 4096; s <= 64ULL << 20; s *= 4)
-        sizes.push_back(s);
+    for (size_t ssz = 4096; ssz <= 64ULL << 20; ssz *= 4)
+        sizes.push_back(ssz);
 
     static const int WARMUP = 100;
-    static const int ITERS  = 1000;
+    static const int ITERS  = 10000;
 
-    // Async benchmark: split timing into issue and transfer-service parts.
-    cudaStream_t issue_stream{};
-    cudaStreamCreate(&issue_stream);
+    std::vector<cudaStream_t> issue_streams((size_t)parallel_reqs, nullptr);
+    for (int lane = 0; lane < parallel_reqs; ++lane) {
+        cudaError_t ce = cudaStreamCreate(&issue_streams[(size_t)lane]);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[issue] cudaStreamCreate failed: lane=%d err=%s\n",
+                    lane, cudaGetErrorString(ce));
+            std::exit(2);
+        }
+    }
 
     std::vector<DirectionRow> h2d_rows;
     h2d_rows.reserve(sizes.size());
-
     for (size_t bytes : sizes) {
-        std::vector<void*> h_src_slots((size_t)pipeline_depth, nullptr);
-        std::vector<void*> d_dst_slots((size_t)pipeline_depth, nullptr);
-        for (int slot = 0; slot < pipeline_depth; ++slot) {
-            cudaHostAlloc(&h_src_slots[(size_t)slot], bytes, cudaHostAllocPortable);
-            cudaMalloc(&d_dst_slots[(size_t)slot], bytes);
-            cudaMemset(d_dst_slots[(size_t)slot], 0, bytes);
-            memset(h_src_slots[(size_t)slot], (slot & 1) ? 0xA5 : 0x5A, bytes);
+        std::vector<void*> h_src_lanes((size_t)parallel_reqs, nullptr);
+        std::vector<void*> d_dst_lanes((size_t)parallel_reqs, nullptr);
+        for (int lane = 0; lane < parallel_reqs; ++lane) {
+            cudaHostAlloc(&h_src_lanes[(size_t)lane], bytes, cudaHostAllocPortable);
+            cudaMalloc(&d_dst_lanes[(size_t)lane], bytes);
+            cudaMemset(d_dst_lanes[(size_t)lane], 0, bytes);
+            memset(h_src_lanes[(size_t)lane], (lane & 1) ? 0xA5 : 0x5A, bytes);
         }
 
-        BenchPair gdr  = run_gdr_timings(ch, *gdr_cq_poller, d_dst_slots, h_src_slots, bytes, GDR_H2D, WARMUP, ITERS);
-        BenchPair cuda = run_cuda_timings(d_dst_slots, h_src_slots, bytes, cudaMemcpyHostToDevice,
-                                          WARMUP, ITERS, issue_stream);
+        BenchPair gdr  = run_gdr_timings(
+            gdr_channels, gdr_cq_listener, d_dst_lanes, h_src_lanes,
+            bytes, GDR_H2D, WARMUP, ITERS);
+        BenchPair cuda = run_cuda_timings(
+            d_dst_lanes, h_src_lanes, bytes, cudaMemcpyHostToDevice,
+            WARMUP, ITERS, issue_streams);
 
         h2d_rows.push_back(DirectionRow{bytes, gdr, cuda});
 
-        for (int slot = 0; slot < pipeline_depth; ++slot) {
-            cudaFreeHost(h_src_slots[(size_t)slot]);
-            cudaFree(d_dst_slots[(size_t)slot]);
+        for (int lane = 0; lane < parallel_reqs; ++lane) {
+            cudaFreeHost(h_src_lanes[(size_t)lane]);
+            cudaFree(d_dst_lanes[(size_t)lane]);
         }
     }
 
     print_latency_table("Host->Device Issue Latency", h2d_rows, true);
-    print_latency_table("Host->Device Transfer Service Latency", h2d_rows, false);
+    print_latency_table("Host->Device Transfer Latency", h2d_rows, false);
 
     std::vector<DirectionRow> d2h_rows;
     d2h_rows.reserve(sizes.size());
-
     for (size_t bytes : sizes) {
-        std::vector<void*> d_src_slots((size_t)pipeline_depth, nullptr);
-        std::vector<void*> h_dst_slots((size_t)pipeline_depth, nullptr);
-        for (int slot = 0; slot < pipeline_depth; ++slot) {
-            cudaMalloc(&d_src_slots[(size_t)slot], bytes);
-            cudaHostAlloc(&h_dst_slots[(size_t)slot], bytes, cudaHostAllocPortable);
-            cudaMemset(d_src_slots[(size_t)slot], (slot & 1) ? 0x5A : 0xA5, bytes);
-            memset(h_dst_slots[(size_t)slot], 0, bytes);
+        std::vector<void*> d_src_lanes((size_t)parallel_reqs, nullptr);
+        std::vector<void*> h_dst_lanes((size_t)parallel_reqs, nullptr);
+        for (int lane = 0; lane < parallel_reqs; ++lane) {
+            cudaMalloc(&d_src_lanes[(size_t)lane], bytes);
+            cudaHostAlloc(&h_dst_lanes[(size_t)lane], bytes, cudaHostAllocPortable);
+            cudaMemset(d_src_lanes[(size_t)lane], (lane & 1) ? 0x5A : 0xA5, bytes);
+            memset(h_dst_lanes[(size_t)lane], 0, bytes);
         }
 
-        BenchPair gdr  = run_gdr_timings(ch, *gdr_cq_poller, h_dst_slots, d_src_slots, bytes, GDR_D2H, WARMUP, ITERS);
-        BenchPair cuda = run_cuda_timings(h_dst_slots, d_src_slots, bytes, cudaMemcpyDeviceToHost,
-                                          WARMUP, ITERS, issue_stream);
+        BenchPair gdr  = run_gdr_timings(
+            gdr_channels, gdr_cq_listener, h_dst_lanes, d_src_lanes,
+            bytes, GDR_D2H, WARMUP, ITERS);
+        BenchPair cuda = run_cuda_timings(
+            h_dst_lanes, d_src_lanes, bytes, cudaMemcpyDeviceToHost,
+            WARMUP, ITERS, issue_streams);
 
         d2h_rows.push_back(DirectionRow{bytes, gdr, cuda});
 
-        for (int slot = 0; slot < pipeline_depth; ++slot) {
-            cudaFree(d_src_slots[(size_t)slot]);
-            cudaFreeHost(h_dst_slots[(size_t)slot]);
+        for (int lane = 0; lane < parallel_reqs; ++lane) {
+            cudaFree(d_src_lanes[(size_t)lane]);
+            cudaFreeHost(h_dst_lanes[(size_t)lane]);
         }
     }
 
     print_latency_table("Device->Host Issue Latency", d2h_rows, true);
-    print_latency_table("Device->Host Transfer Service Latency", d2h_rows, false);
+    print_latency_table("Device->Host Transfer Latency", d2h_rows, false);
 
-    cudaStreamDestroy(issue_stream);
+    for (auto& stream : issue_streams) {
+        if (stream) cudaStreamDestroy(stream);
+    }
 
-    // ── Summary ───────────────────────────────────────────────────────────
-    GDRStats final_s = ch->stats();
+    GDRStats final_s = aggregate_stats(gdr_channels);
     printf("\n=================================================================\n");
     printf("Total ops: %lu  (RDMA: %lu  Fallback: %lu)\n",
            final_s.total_ops, final_s.rdma_ops, final_s.fallback_ops);
-    printf("Total bytes: %.2f GiB\n", final_s.total_bytes / (double)(1ULL<<30));
+    printf("Total bytes: %.2f GiB\n", final_s.total_bytes / (double)(1ULL << 30));
     printf("=================================================================\n");
 
-    gdr_cq_poller->stop();
-    gdr_cq_poller.reset();
+    gdr_cq_listener.stop();
     GDRCopyLib::shutdown();
     return 0;
 }
