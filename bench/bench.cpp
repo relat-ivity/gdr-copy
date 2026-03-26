@@ -77,6 +77,9 @@ static BenchPair run_gdr_timings(std::shared_ptr<GDRCopyChannel> ch,
                                  int warmup, int iters)
 {
     ch->reset_stats();
+    std::vector<double> issue_samples;
+    issue_samples.reserve(iters);
+
     auto run_batch = [&](int count, bool measure) -> double {
         if (count <= 0) return 0.0;
 
@@ -87,8 +90,14 @@ static BenchPair run_gdr_timings(std::shared_ptr<GDRCopyChannel> ch,
         int issued = 0;
         int done = 0;
         while (issued < count) {
+            double t_issue0 = 0.0;
+            if (measure) t_issue0 = now_us();
             int rc = ch->memcpy_async(dst, src, bytes, kind);
             if (rc == 0) {
+                if (measure) {
+                    double t_issue1 = now_us();
+                    issue_samples.push_back(t_issue1 - t_issue0);
+                }
                 ++issued;
                 continue;
             }
@@ -133,7 +142,7 @@ static BenchPair run_gdr_timings(std::shared_ptr<GDRCopyChannel> ch,
     double total_us = run_batch(iters, true);
 
     BenchPair out{};
-    out.issue = BenchResult{0.0, 0.0, 0.0};
+    out.issue = analyse(issue_samples, bytes);
     out.transfer.median_us = total_us;
     out.transfer.p99_us = total_us;
     out.transfer.bw_GBs = (iters > 0 && total_us > 0.0)
@@ -188,6 +197,27 @@ static BenchPair run_cuda_timings(void* dst, const void* src,
                                   size_t bytes, cudaMemcpyKind kind,
                                   int warmup, int iters, cudaStream_t stream)
 {
+    std::vector<double> issue_samples;
+    issue_samples.reserve(iters);
+
+    // 先测纯下发耗时：每次下发后立刻同步，避免队列背压把等待时间算进 issue。
+    for (int i = 0; i < warmup + iters; ++i) {
+        double t0 = now_us();
+        cudaError_t ce = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+        double t1 = now_us();
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[issue] cudaMemcpyAsync failed: %s i=%d/%d\n",
+                    cudaGetErrorString(ce), i, warmup + iters);
+            std::exit(2);
+        }
+        ce = cudaStreamSynchronize(stream);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[issue] cudaStreamSynchronize failed: %s\n", cudaGetErrorString(ce));
+            std::exit(2);
+        }
+        if (i >= warmup) issue_samples.push_back(t1 - t0);
+    }
+
     auto run_batch = [&](int count, bool measure) -> double {
         if (count <= 0) return 0.0;
 
@@ -219,7 +249,7 @@ static BenchPair run_cuda_timings(void* dst, const void* src,
     double total_us = run_batch(iters, true);
 
     BenchPair out{};
-    out.issue = BenchResult{0.0, 0.0, 0.0};
+    out.issue = analyse(issue_samples, bytes);
     out.transfer.median_us = total_us;
     out.transfer.p99_us = total_us;
     out.transfer.bw_GBs = (iters > 0 && total_us > 0.0)
@@ -257,7 +287,7 @@ int main(int argc, char** argv)
     GDRStats s = ch->stats();
     bool gdr_active = (s.fallback_ops == 0);
     printf("GPUDirect RDMA path: %s\n\n", gdr_active ? "ACTIVE" : "FALLBACK (cudaMemcpy)");
-    printf("Benchmark mode: issue-with-backpressure then sync-drain, bandwidth only\n\n");
+    printf("Benchmark mode: async issue latency (isolated) + sync-drain bandwidth\n\n");
 
     // ── Transfer sizes to sweep ───────────────────────────────────────────
     std::vector<size_t> sizes;
@@ -265,9 +295,9 @@ int main(int argc, char** argv)
         sizes.push_back(s);
 
     static const int WARMUP = 100;
-    static const int ITERS  = 10000;
+    static const int ITERS  = 1000;
 
-    // 只输出带宽。
+    // 输出异步下发时延和带宽。
     cudaStream_t issue_stream{};
     cudaStreamCreate(&issue_stream);
 
@@ -292,6 +322,7 @@ int main(int argc, char** argv)
         cudaFree(d_dst);
     }
 
+    print_latency_table("Host->Device Issue Latency", h2d_rows, true);
     print_latency_table("Host->Device Bandwidth", h2d_rows, false);
 
     // Reopen channel before D2H sweep to avoid stale GPU MR reuse.
@@ -324,6 +355,7 @@ int main(int argc, char** argv)
         cudaFreeHost(h_dst);
     }
 
+    print_latency_table("Device->Host Issue Latency", d2h_rows, true);
     print_latency_table("Device->Host Bandwidth", d2h_rows, false);
 
     cudaStreamDestroy(issue_stream);

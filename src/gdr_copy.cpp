@@ -63,8 +63,9 @@
 
 // ── compile-time tuning ───────────────────────────────────────────────────────
 static constexpr int    MR_CACHE_CAP  = 256;   // LRU entries for GPU MRs
-static constexpr int    CQ_DEPTH_TARGET = 1024;
-static constexpr int    QP_MAX_WR_TARGET = 1024;
+static constexpr int    CQ_DEPTH_TARGET = 5000;
+static constexpr int    QP_MAX_WR_TARGET = 30000;
+static constexpr int    QP_MAX_RECV_WR_TARGET = 100;
 static constexpr int    MAX_POLL_US   = 5000;  // 5 ms poll timeout
 static constexpr int    IBV_PORT      = 1;
 
@@ -330,12 +331,21 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
     struct ibv_qp_init_attr qi{};
     qi.send_cq          = cq_;
     qi.recv_cq          = cq_;
-    int qp_wr_req = QP_MAX_WR_TARGET;
-    if (dev_attr.max_qp_wr > 0)
-        qp_wr_req = std::min(qp_wr_req, static_cast<int>(dev_attr.max_qp_wr));
-    if (qp_wr_req < 1) qp_wr_req = 1;
-    qi.cap.max_send_wr  = qp_wr_req;
-    qi.cap.max_recv_wr  = qp_wr_req;
+    int qp_recv_wr_req = QP_MAX_RECV_WR_TARGET;
+    if (qp_recv_wr_req < 1) qp_recv_wr_req = 1;
+
+    int qp_send_wr_req = QP_MAX_WR_TARGET;
+    if (dev_attr.max_qp_wr > 0) {
+        // Some providers account send+recv WR against max_qp_wr.
+        int max_qp_wr_total = static_cast<int>(dev_attr.max_qp_wr);
+        qp_send_wr_req = std::min(qp_send_wr_req, std::max(1, max_qp_wr_total - qp_recv_wr_req));
+    }
+    // All WRs are signaled in this benchmark; keep SQ not larger than CQ budget.
+    qp_send_wr_req = std::min(qp_send_wr_req, std::max(1, cq_depth_req - 1));
+    if (qp_send_wr_req < 1) qp_send_wr_req = 1;
+
+    qi.cap.max_send_wr  = qp_send_wr_req;
+    qi.cap.max_recv_wr  = qp_recv_wr_req;
     qi.cap.max_send_sge = 1;
     qi.cap.max_recv_sge = 1;
     qi.cap.max_inline_data = 64;
@@ -344,7 +354,7 @@ GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
 
     qp_ = ibv_create_qp(pd_, &qi);
     if (!qp_) throw std::runtime_error("ibv_create_qp (RC) failed");
-    qp_max_wr_ = static_cast<int>(qi.cap.max_send_wr > 0 ? qi.cap.max_send_wr : qp_wr_req);
+    qp_max_wr_ = static_cast<int>(qi.cap.max_send_wr > 0 ? qi.cap.max_send_wr : qp_send_wr_req);
     wr_budget_ = std::min(qp_max_wr_, cq_depth_ - 1);
     if (wr_budget_ < 1) wr_budget_ = 1;
 
