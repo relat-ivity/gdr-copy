@@ -443,9 +443,19 @@ int main(int argc, char** argv)
     // Force UCX to use GPUDirect (gdr_copy) path: NIC DMA engine reads/writes
     // GPU memory directly via nvidia-peermem, bypassing CPU on the data path.
     // Must be set before any UCX/NIXL context is created.
-    setenv("UCX_TLS",                "gdr_copy,rc_x", 0);
-    setenv("UCX_IB_GPU_DIRECT_RDMA", "yes",           0);
-    setenv("UCX_MEMTYPE_CACHE",      "y",              0);
+    // Force UCX to use RC RDMA with GPUDirect (nvidia-peermem):
+    // NIC DMA engine writes directly into GPU memory — host→NIC→GPU path.
+    // This mirrors the ibverbs RDMA_WRITE(pinned_host lkey → GPU rkey) in gdr_copy.cpp.
+    // Do not force UCX to pure IB transports only. NIXL validates CUDA support
+    // from the UCX context memory_types bitmask, and a too-narrow UCX_TLS such as
+    // "rc_x" filters CUDA memory components out of the context. That makes VRAM
+    // appear as host memory even when UCX was built with CUDA support.
+    //
+    // Keep the default broad enough to retain CUDA memory registration support.
+    // gdr_copy is not forced here because it is optional and absent on many
+    // systems unless gdrcopy is installed and UCX was built against it.
+    setenv("UCX_TLS",                "rc_x,cuda", 0);
+    setenv("UCX_IB_GPU_DIRECT_RDMA", "yes",            0);
     setenv("UCX_RNDV_THRESH",        "0",              0);
     setenv("UCX_ZCOPY_THRESH",       "0",              0);
 
