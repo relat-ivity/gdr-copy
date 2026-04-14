@@ -2,8 +2,8 @@
  * bench.cpp - GDR Copy vs NIXL-UCX timing benchmark
  *
  * Usage:
- *   sudo ./build/bench [gpu_id] [nic_name]
- *   sudo ./build/bench 0 mlx5_0
+ *   sudo ./build/bench [gpu_id] [nic_name] [nixl_threads]
+ *   sudo ./build/bench 0 mlx5_0 2
  *
  * Output:
  *   For each transfer size x direction, prints:
@@ -26,6 +26,7 @@
 #include <nixl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -85,9 +86,10 @@ static nixlBlobDesc make_nixl_blob_desc(void* ptr, size_t bytes, uint64_t dev_id
 
 class NixlLoopbackPair {
 public:
-    NixlLoopbackPair(int gpu_id, const std::string& nic_name)
-        : initiator_name_("bench-init-" + std::to_string(gpu_id)),
-          target_name_("bench-target-" + std::to_string(gpu_id)),
+    NixlLoopbackPair(int gpu_id, const std::string& nic_name,
+                     const std::string& name_suffix = "")
+        : initiator_name_("bench-init-" + std::to_string(gpu_id) + name_suffix),
+          target_name_("bench-target-" + std::to_string(gpu_id) + name_suffix),
           initiator_(initiator_name_, make_agent_config()),
           target_(target_name_, make_agent_config()) {
         nixl_mem_list_t initiator_mems;
@@ -333,103 +335,152 @@ static void print_latency_table(const char* title,
 
 static BenchPair run_nixl_timings(size_t bytes, cudaMemcpyKind kind,
                                   int warmup, int iters,
-                                  int gpu_id, const std::string& nic_name)
+                                  int gpu_id, const std::string& nic_name,
+                                  int submit_threads)
 {
-    std::vector<double> issue_samples;
-    issue_samples.reserve(iters);
+    if (submit_threads < 1)
+        submit_threads = 1;
 
-    cudaError_t ce = cudaSetDevice(gpu_id);
-    if (ce != cudaSuccess) {
-        fprintf(stderr, "[nixl] cudaSetDevice failed: %s\n", cudaGetErrorString(ce));
-        std::exit(2);
-    }
+    std::vector<std::vector<double>> issue_samples_by_thread(submit_threads);
+    for (auto& samples : issue_samples_by_thread)
+        samples.reserve(iters);
 
-    void* host_buf = nullptr;
-    void* gpu_buf  = nullptr;
-    nixl_mem_t   host_mem, gpu_mem;
-    nixl_xfer_op_t op;
+    std::atomic<int> ready_threads{0};
+    std::atomic<int> finished_threads{0};
+    std::atomic<bool> start_measure{false};
 
-    switch (kind) {
-        case cudaMemcpyHostToDevice:
-            host_mem = DRAM_SEG; gpu_mem = VRAM_SEG; op = NIXL_WRITE;
-            ce = cudaHostAlloc(&host_buf, bytes, cudaHostAllocPortable);
-            if (ce == cudaSuccess) ce = cudaMalloc(&gpu_buf, bytes);
-            if (ce == cudaSuccess) std::memset(host_buf, 0xA5, bytes);
-            if (ce == cudaSuccess) ce = cudaMemset(gpu_buf, 0, bytes);
-            break;
-        case cudaMemcpyDeviceToHost:
-            host_mem = DRAM_SEG; gpu_mem = VRAM_SEG; op = NIXL_READ;
-            ce = cudaHostAlloc(&host_buf, bytes, cudaHostAllocPortable);
-            if (ce == cudaSuccess) ce = cudaMalloc(&gpu_buf, bytes);
-            if (ce == cudaSuccess) std::memset(host_buf, 0, bytes);
-            if (ce == cudaSuccess) ce = cudaMemset(gpu_buf, 0x5A, bytes);
-            break;
-        default:
-            fprintf(stderr, "[nixl] unsupported cudaMemcpyKind=%d\n", (int)kind);
+    // Each thread owns a complete NIXL loopback pair, its own host/device buffers,
+    // and a full batch of handles. That keeps the concurrency model simple:
+    // no shared request state, no shared memory regions, and each thread does a
+    // full post-all + wait-all cycle independently.
+    auto worker = [&](int tid) {
+        cudaError_t ce = cudaSetDevice(gpu_id);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[nixl] cudaSetDevice failed: %s tid=%d\n",
+                    cudaGetErrorString(ce), tid);
             std::exit(2);
-    }
-    if (ce != cudaSuccess) {
-        fprintf(stderr, "[nixl] buffer alloc failed: %s\n", cudaGetErrorString(ce));
-        std::exit(2);
-    }
+        }
 
-    nixl_reg_dlist_t initiator_regs(host_mem);
-    nixl_reg_dlist_t target_regs(gpu_mem);
-    initiator_regs.addDesc(make_nixl_blob_desc(host_buf, bytes, 0));
-    target_regs.addDesc(make_nixl_blob_desc(gpu_buf, bytes, (uint64_t)gpu_id));
+        void* host_buf = nullptr;
+        void* gpu_buf  = nullptr;
+        nixl_mem_t host_mem, gpu_mem;
+        nixl_xfer_op_t op;
 
-    NixlLoopbackPair pair(gpu_id, nic_name);
-    pair.register_buffers(initiator_regs, target_regs);
+        switch (kind) {
+            case cudaMemcpyHostToDevice:
+                host_mem = DRAM_SEG; gpu_mem = VRAM_SEG; op = NIXL_WRITE;
+                ce = cudaHostAlloc(&host_buf, bytes, cudaHostAllocPortable);
+                if (ce == cudaSuccess) ce = cudaMalloc(&gpu_buf, bytes);
+                if (ce == cudaSuccess) std::memset(host_buf, 0xA5, bytes);
+                if (ce == cudaSuccess) ce = cudaMemset(gpu_buf, 0, bytes);
+                break;
+            case cudaMemcpyDeviceToHost:
+                host_mem = DRAM_SEG; gpu_mem = VRAM_SEG; op = NIXL_READ;
+                ce = cudaHostAlloc(&host_buf, bytes, cudaHostAllocPortable);
+                if (ce == cudaSuccess) ce = cudaMalloc(&gpu_buf, bytes);
+                if (ce == cudaSuccess) std::memset(host_buf, 0, bytes);
+                if (ce == cudaSuccess) ce = cudaMemset(gpu_buf, 0x5A, bytes);
+                break;
+            default:
+                fprintf(stderr, "[nixl] unsupported cudaMemcpyKind=%d\n", (int)kind);
+                std::exit(2);
+        }
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[nixl] buffer alloc failed: %s tid=%d\n",
+                    cudaGetErrorString(ce), tid);
+            std::exit(2);
+        }
 
-    nixl_xfer_dlist_t local_descs(host_mem);
-    nixl_xfer_dlist_t remote_descs(gpu_mem);
-    local_descs.addDesc(make_nixl_basic_desc(host_buf, bytes, 0));
-    remote_descs.addDesc(make_nixl_basic_desc(gpu_buf, bytes, (uint64_t)gpu_id));
+        nixl_reg_dlist_t initiator_regs(host_mem);
+        nixl_reg_dlist_t target_regs(gpu_mem);
+        initiator_regs.addDesc(make_nixl_blob_desc(host_buf, bytes, 0));
+        target_regs.addDesc(make_nixl_blob_desc(gpu_buf, bytes, (uint64_t)gpu_id));
 
-    // Pre-create handles; reused across warmup and measured phases.
-    const int n_handles = std::max(warmup, iters);
-    std::vector<nixlXferReqH*> handles(n_handles, nullptr);
-    for (int i = 0; i < n_handles; ++i)
-        handles[i] = pair.create_request(op, local_descs, remote_descs);
+        std::string pair_suffix = "-t" + std::to_string(tid) +
+                                  "-k" + std::to_string((int)kind) +
+                                  "-b" + std::to_string(bytes);
+        NixlLoopbackPair pair(gpu_id, nic_name, pair_suffix);
+        pair.register_buffers(initiator_regs, target_regs);
 
-    // Warmup: sequential post+wait, no measurement.
-    for (int i = 0; i < warmup; ++i) {
-        pair.post_request(handles[i]);
-        pair.wait_request(handles[i]);
-    }
+        nixl_xfer_dlist_t local_descs(host_mem);
+        nixl_xfer_dlist_t remote_descs(gpu_mem);
+        local_descs.addDesc(make_nixl_basic_desc(host_buf, bytes, 0));
+        remote_descs.addDesc(make_nixl_basic_desc(gpu_buf, bytes, (uint64_t)gpu_id));
 
-    // Measured: post all (record per-post issue latency), then wait all.
-    // Total time covers the full post→wait window for bandwidth.
+        const int n_handles = std::max(warmup, iters);
+        std::vector<nixlXferReqH*> handles(n_handles, nullptr);
+        for (int i = 0; i < n_handles; ++i)
+            handles[i] = pair.create_request(op, local_descs, remote_descs);
+
+        for (int i = 0; i < warmup; ++i) {
+            pair.post_request(handles[i]);
+            pair.wait_request(handles[i]);
+        }
+
+        ready_threads.fetch_add(1, std::memory_order_release);
+        while (!start_measure.load(std::memory_order_acquire))
+            std::this_thread::yield();
+
+        for (int i = 0; i < iters; ++i) {
+            double ti = now_us();
+            nixl_status_t rc = pair.post_request(handles[i]);
+            issue_samples_by_thread[tid].push_back(now_us() - ti);
+            if (rc != NIXL_SUCCESS && rc != NIXL_IN_PROG) {
+                fprintf(stderr, "[nixl] postXferReq failed iter=%d tid=%d rc=%d\n",
+                        i, tid, (int)rc);
+                std::exit(2);
+            }
+        }
+        for (int i = 0; i < iters; ++i) {
+            nixl_status_t rc = pair.wait_request(handles[i]);
+            if (rc != NIXL_SUCCESS) {
+                fprintf(stderr, "[nixl] wait failed iter=%d tid=%d rc=%d\n",
+                        i, tid, (int)rc);
+                std::exit(2);
+            }
+        }
+
+        // Mark completion immediately after this thread finishes its measured
+        // post-all + wait-all section. Cleanup below is intentionally excluded
+        // from the bandwidth timing window.
+        finished_threads.fetch_add(1, std::memory_order_release);
+
+        for (auto* h : handles)
+            pair.release_request(h);
+        pair.deregister_buffers(initiator_regs, target_regs);
+        cudaFreeHost(host_buf);
+        cudaFree(gpu_buf);
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(submit_threads);
+    for (int tid = 0; tid < submit_threads; ++tid)
+        workers.emplace_back(worker, tid);
+
+    while (ready_threads.load(std::memory_order_acquire) != submit_threads)
+        std::this_thread::yield();
+
     double t0 = now_us();
-    for (int i = 0; i < iters; ++i) {
-        double ti = now_us();
-        nixl_status_t rc = pair.post_request(handles[i]);
-        issue_samples.push_back(now_us() - ti);
-        if (rc != NIXL_SUCCESS && rc != NIXL_IN_PROG) {
-            fprintf(stderr, "[nixl] postXferReq failed iter=%d rc=%d\n", i, (int)rc);
-            std::exit(2);
-        }
-    }
-    for (int i = 0; i < iters; ++i) {
-        nixl_status_t rc = pair.wait_request(handles[i]);
-        if (rc != NIXL_SUCCESS) {
-            fprintf(stderr, "[nixl] wait failed iter=%d rc=%d\n", i, (int)rc);
-            std::exit(2);
-        }
-    }
+    start_measure.store(true, std::memory_order_release);
+    while (finished_threads.load(std::memory_order_acquire) != submit_threads)
+        std::this_thread::yield();
     double total_us = now_us() - t0;
 
-    for (auto* h : handles) pair.release_request(h);
-    pair.deregister_buffers(initiator_regs, target_regs);
-    cudaFreeHost(host_buf);
-    cudaFree(gpu_buf);
+    for (auto& worker_thread : workers)
+        worker_thread.join();
+
+    std::vector<double> issue_samples;
+    issue_samples.reserve((size_t)iters * (size_t)submit_threads);
+    for (auto& per_thread : issue_samples_by_thread) {
+        issue_samples.insert(issue_samples.end(), per_thread.begin(), per_thread.end());
+    }
 
     BenchPair out{};
     out.issue = analyse(issue_samples, bytes);
     out.transfer.median_us = total_us;
     out.transfer.p99_us    = total_us;
     out.transfer.bw_GBs    = (iters > 0 && total_us > 0.0)
-                               ? ((double)bytes * iters / 1e9) / (total_us / 1e6)
+                               ? ((double)bytes * iters * submit_threads / 1e9) / (total_us / 1e6)
                                : 0.0;
     return out;
 }
@@ -439,6 +490,7 @@ int main(int argc, char** argv)
 {
     int         gpu_id   = (argc > 1) ? std::atoi(argv[1]) : 0;
     std::string  nic_name = (argc > 2) ? argv[2]            : "mlx5_0";
+    int         nixl_threads = (argc > 3) ? std::max(1, std::atoi(argv[3])) : 1;
 
     // Force UCX to use GPUDirect (gdr_copy) path: NIC DMA engine reads/writes
     // GPU memory directly via nvidia-peermem, bypassing CPU on the data path.
@@ -454,7 +506,8 @@ int main(int argc, char** argv)
     // Keep the default broad enough to retain CUDA memory registration support.
     // gdr_copy is not forced here because it is optional and absent on many
     // systems unless gdrcopy is installed and UCX was built against it.
-    setenv("UCX_TLS",                "rc_x,cuda", 0);
+    setenv("UCX_TLS",                "rc_x,cud
+        a_copy,cuda_ipc", 0);
     setenv("UCX_IB_GPU_DIRECT_RDMA", "yes",            0);
     setenv("UCX_RNDV_THRESH",        "0",              0);
     setenv("UCX_ZCOPY_THRESH",       "0",              0);
@@ -482,7 +535,8 @@ int main(int argc, char** argv)
     GDRStats s = ch->stats();
     bool gdr_active = (s.fallback_ops == 0);
     printf("GPUDirect RDMA path: %s\n\n", gdr_active ? "ACTIVE" : "FALLBACK (cudaMemcpy)");
-    printf("Benchmark mode: NIXL-UCX issue latency + wait-all bandwidth\n\n");
+    printf("Benchmark mode: NIXL-UCX issue latency + per-thread wait-all bandwidth (threads=%d)\n\n",
+           nixl_threads);
 
     // Transfer sizes to sweep.
     std::vector<size_t> sizes;
@@ -505,7 +559,8 @@ int main(int argc, char** argv)
 
         BenchPair gdr  = run_gdr_timings(ch, d_dst, h_src, bytes, GDR_H2D, WARMUP, ITERS);
         BenchPair nixl = run_nixl_timings(bytes, cudaMemcpyHostToDevice,
-                                          WARMUP, ITERS, gpu_id, nic_name);
+                                          WARMUP, ITERS, gpu_id, nic_name,
+                                          nixl_threads);
 
         h2d_rows.push_back(DirectionRow{bytes, gdr, nixl});
 
@@ -538,7 +593,8 @@ int main(int argc, char** argv)
 
         BenchPair gdr  = run_gdr_timings(ch, h_dst, d_src, bytes, GDR_D2H, WARMUP, ITERS);
         BenchPair nixl = run_nixl_timings(bytes, cudaMemcpyDeviceToHost,
-                                          WARMUP, ITERS, gpu_id, nic_name);
+                                          WARMUP, ITERS, gpu_id, nic_name,
+                                          nixl_threads);
 
         d2h_rows.push_back(DirectionRow{bytes, gdr, nixl});
 
