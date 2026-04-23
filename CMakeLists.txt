@@ -154,6 +154,11 @@ target_link_libraries(bench PRIVATE gdr_copy_static ${NIXL_BENCH_TARGET})
 set_target_properties(bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
 
+add_executable(bench_dual_gdr_h2d bench/bench_dual_gdr_h2d.cpp)
+target_link_libraries(bench_dual_gdr_h2d PRIVATE gdr_copy_static)
+set_target_properties(bench_dual_gdr_h2d PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS gdr_copy_static DESTINATION lib)
 install(FILES include/gdr_copy.h DESTINATION include)

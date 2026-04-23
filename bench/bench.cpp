@@ -1,4 +1,4 @@
-/**
+﻿/**
  * bench.cpp - GDR Copy vs NIXL-UCX timing benchmark
  *
  * Usage:
@@ -508,7 +508,8 @@ int main(int argc, char** argv)
     // systems unless gdrcopy is installed and UCX was built against it.
     setenv("UCX_TLS",                "rc_x,cuda_copy,cuda_ipc", 0);
     setenv("UCX_IB_GPU_DIRECT_RDMA", "yes",            0);
-    setenv("UCX_RNDV_THRESH",        "0",              0);
+    setenv("UCX_RNDV_THRESH",  
+              "0",              0);
     setenv("UCX_ZCOPY_THRESH",       "0",              0);
 
     printf("=================================================================\n");
