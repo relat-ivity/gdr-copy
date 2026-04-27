@@ -114,6 +114,32 @@ static double run_gdr_h2d_batch(const std::shared_ptr<GDRCopyChannel>& ch,
     return measure ? (now_us() - t0) : 0.0;
 }
 
+static void prime_gdr_h2d_window(const std::shared_ptr<GDRCopyChannel>& ch,
+                                 void* dst, const void* src,
+                                 size_t bytes, int gpu_id)
+{
+    int rc = ch->memcpy_async(dst, src, bytes, GDR_H2D);
+    if (rc != 0) {
+        fprintf(stderr,
+                "[dual] gdr prime memcpy_async failed: gpu=%d rc=%d bytes=%zu\n",
+                gpu_id, rc, bytes);
+        std::exit(2);
+    }
+
+    while (true) {
+        int sc = ch->sync();
+        if (sc == 0)
+            break;
+        if (sc == -EAGAIN)
+            continue;
+        fprintf(stderr,
+                "[dual] gdr prime sync failed: gpu=%d rc=%d bytes=%zu\n",
+                gpu_id, sc, bytes);
+        std::exit(2);
+    }
+    ch->reset_stats();
+}
+
 struct GpuLane {
     int gpu_id = -1;
     std::shared_ptr<GDRCopyChannel> channel;
@@ -204,9 +230,15 @@ int main(int argc, char** argv)
     uint64_t total_ops = 0;
     uint64_t total_bytes = 0;
 
+    const size_t max_bytes = sizes.back();
+    allocate_lane_buffers(lanes[0], max_bytes);
+    allocate_lane_buffers(lanes[1], max_bytes);
+    prime_gdr_h2d_window(lanes[0].channel, lanes[0].device_dst, lanes[0].host_src,
+                         max_bytes, lanes[0].gpu_id);
+    prime_gdr_h2d_window(lanes[1].channel, lanes[1].device_dst, lanes[1].host_src,
+                         max_bytes, lanes[1].gpu_id);
+
     for (size_t bytes : sizes) {
-        allocate_lane_buffers(lanes[0], bytes);
-        allocate_lane_buffers(lanes[1], bytes);
 
         std::atomic<int> ready{0};
         std::atomic<int> finished{0};
@@ -257,10 +289,10 @@ int main(int argc, char** argv)
 
         total_ops += (uint64_t)ITERS * 2ULL;
         total_bytes += (uint64_t)bytes * (uint64_t)ITERS * 2ULL;
-
-        free_lane_buffers(lanes[0]);
-        free_lane_buffers(lanes[1]);
     }
+
+    free_lane_buffers(lanes[0]);
+    free_lane_buffers(lanes[1]);
 
     printf("\n=================================================================\n");
     printf("Total ops: %lu\n", (unsigned long)total_ops);

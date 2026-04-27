@@ -19,7 +19,7 @@
  *   GDRCopyLib (singleton factory)
  *     └─ GDRCopyChannel  (one per GPU × NIC pair)
  *          ├─ RC QP pair (loopback, one for H2D one for D2H)
- *          ├─ MRCache    (LRU, avoids re-registering GPU memory)
+ *          ├─ fixed MR windows (reuse one host MR + one GPU MR)
  *          └─ PinnedPool (pre-pinned host bounce buffers)
  *
  * Usage

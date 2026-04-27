@@ -258,6 +258,32 @@ static BenchPair run_cuda_timings(void* dst, const void* src,
     return out;
 }
 
+static void prime_gdr_window(std::shared_ptr<GDRCopyChannel> ch,
+                             void* dst, const void* src,
+                             size_t bytes, GDRCopyKind kind)
+{
+    // 先用最大块做一次非统计提交，让 channel 把后续要复用的 host/GPU buffer
+    // 注册成固定 MR window。后面的尺寸 sweep 都只使用这块 buffer 的前缀。
+    int rc = ch->memcpy_async(dst, src, bytes, kind);
+    if (rc != 0) {
+        fprintf(stderr, "[prime] gdr memcpy_async failed: rc=%d kind=%d bytes=%zu\n",
+                rc, (int)kind, bytes);
+        std::exit(2);
+    }
+
+    while (true) {
+        int sc = ch->sync();
+        if (sc == 0)
+            break;
+        if (sc == -EAGAIN)
+            continue;
+        fprintf(stderr, "[prime] gdr sync failed: rc=%d kind=%d bytes=%zu\n",
+                sc, (int)kind, bytes);
+        std::exit(2);
+    }
+    ch->reset_stats();
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
@@ -293,6 +319,7 @@ int main(int argc, char** argv)
     std::vector<size_t> sizes;
     for (size_t s = 4096; s <= 64ULL << 20; s *= 4)
         sizes.push_back(s);
+    const size_t max_bytes = sizes.back();
 
     static const int WARMUP = 100;
     static const int ITERS  = 10000;
@@ -304,23 +331,25 @@ int main(int argc, char** argv)
     std::vector<DirectionRow> h2d_rows;
     h2d_rows.reserve(sizes.size());
 
-    for (size_t bytes : sizes) {
-        void* h_src = nullptr;
-        void* d_dst = nullptr;
-        cudaHostAlloc(&h_src, bytes, cudaHostAllocPortable);
-        cudaMalloc(&d_dst, bytes);
-        cudaMemset(d_dst, 0, bytes);
-        memset(h_src, 0xA5, bytes);
+    void* h_src = nullptr;
+    void* d_dst = nullptr;
+    cudaHostAlloc(&h_src, max_bytes, cudaHostAllocPortable);
+    cudaMalloc(&d_dst, max_bytes);
+    cudaMemset(d_dst, 0, max_bytes);
+    memset(h_src, 0xA5, max_bytes);
 
+    prime_gdr_window(ch, d_dst, h_src, max_bytes, GDR_H2D);
+
+    for (size_t bytes : sizes) {
         BenchPair gdr  = run_gdr_timings(ch, d_dst, h_src, bytes, GDR_H2D, WARMUP, ITERS);
         BenchPair cuda = run_cuda_timings(d_dst, h_src, bytes, cudaMemcpyHostToDevice,
                                           WARMUP, ITERS, issue_stream);
 
         h2d_rows.push_back(DirectionRow{bytes, gdr, cuda});
-
-        cudaFreeHost(h_src);
-        cudaFree(d_dst);
     }
+
+    cudaFreeHost(h_src);
+    cudaFree(d_dst);
 
     print_latency_table("Host->Device Issue Latency", h2d_rows, true);
     print_latency_table("Host->Device Bandwidth", h2d_rows, false);
@@ -337,23 +366,25 @@ int main(int argc, char** argv)
     std::vector<DirectionRow> d2h_rows;
     d2h_rows.reserve(sizes.size());
 
-    for (size_t bytes : sizes) {
-        void* d_src = nullptr;
-        void* h_dst = nullptr;
-        cudaMalloc(&d_src, bytes);
-        cudaHostAlloc(&h_dst, bytes, cudaHostAllocPortable);
-        cudaMemset(d_src, 0x5A, bytes);
-        memset(h_dst, 0, bytes);
+    void* d_src = nullptr;
+    void* h_dst = nullptr;
+    cudaMalloc(&d_src, max_bytes);
+    cudaHostAlloc(&h_dst, max_bytes, cudaHostAllocPortable);
+    cudaMemset(d_src, 0x5A, max_bytes);
+    memset(h_dst, 0, max_bytes);
 
+    prime_gdr_window(ch, h_dst, d_src, max_bytes, GDR_D2H);
+
+    for (size_t bytes : sizes) {
         BenchPair gdr  = run_gdr_timings(ch, h_dst, d_src, bytes, GDR_D2H, WARMUP, ITERS);
         BenchPair cuda = run_cuda_timings(h_dst, d_src, bytes, cudaMemcpyDeviceToHost,
                                           WARMUP, ITERS, issue_stream);
 
         d2h_rows.push_back(DirectionRow{bytes, gdr, cuda});
-
-        cudaFree(d_src);
-        cudaFreeHost(h_dst);
     }
+
+    cudaFree(d_src);
+    cudaFreeHost(h_dst);
 
     print_latency_table("Device->Host Issue Latency", d2h_rows, true);
     print_latency_table("Device->Host Bandwidth", d2h_rows, false);

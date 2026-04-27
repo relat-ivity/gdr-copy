@@ -41,7 +41,6 @@
  */
 
 #include "gdr_copy.h"
-#include "mr_cache.h"
 #include "pinned_pool.h"
 
 #include <infiniband/verbs.h>
@@ -62,7 +61,6 @@
 #include <vector>
 
 // ── compile-time tuning ───────────────────────────────────────────────────────
-static constexpr int    MR_CACHE_CAP  = 256;   // LRU entries for GPU MRs
 static constexpr int    CQ_DEPTH_TARGET = 5000;
 static constexpr int    QP_MAX_WR_TARGET = 30000;
 static constexpr int    QP_MAX_RECV_WR_TARGET = 100;
@@ -212,9 +210,14 @@ private:
     struct ibv_cq*           cq_   = nullptr;
     struct ibv_qp*           qp_   = nullptr;   // loopback RC QP
 
-    // GPU MR cache (addr+len → ibv_mr*)
-    MRCache mr_cache_;
-    MRCache host_mr_cache_;
+    // 固定 MR window：后续请求只要落在这个区间内，就不再重复注册。
+    struct RegisteredWindow {
+        uint64_t base = 0;
+        size_t len = 0;
+        struct ibv_mr* mr = nullptr;
+    };
+    RegisteredWindow gpu_window_;
+    RegisteredWindow host_window_;
 
     // Pinned host buffer pool
     std::unique_ptr<PinnedPool> pool_;
@@ -248,6 +251,9 @@ private:
     // Internal helpers
     struct ibv_mr* get_gpu_mr(uint64_t gpu_va, size_t len);
     struct ibv_mr* get_host_mr(uint64_t host_va, size_t len);
+    struct ibv_mr* ensure_window_mr(RegisteredWindow& window,
+                                    uint64_t addr, size_t len,
+                                    bool is_gpu_window);
 
     int do_h2d(void* dst_gpu, const void* src_host, size_t bytes);
     int do_d2h(void*       dst_host, const void* src_gpu,  size_t bytes);
@@ -275,8 +281,7 @@ private:
 GDRCopyChannelImpl::GDRCopyChannelImpl(int gpu_id,
                                        const std::string& nic_name,
                                        bool use_odp)
-    : mr_cache_(MR_CACHE_CAP), host_mr_cache_(MR_CACHE_CAP),
-      gpu_id_(gpu_id), nic_name_(nic_name)
+    : gpu_id_(gpu_id), nic_name_(nic_name)
 {
     // ── 1. Set CUDA device ────────────────────────────────────────────────
     check_cuda(cudaSetDevice(gpu_id_), "cudaSetDevice");
@@ -399,11 +404,14 @@ GDRCopyChannelImpl::~GDRCopyChannelImpl() {
 
     pool_.reset();   // dereg pinned MRs before destroying PD
 
-    // Flush MR cache
-    // (MRCache destructor does NOT call ibv_dereg_mr; we do it here so
-    //  we still have pd_ alive.)
-    // Simple approach: clear without dereg — ibv_destroy_qp will flush.
-    // For a production lib, track and dereg each MR explicitly.
+    if (gpu_window_.mr) {
+        ibv_dereg_mr(gpu_window_.mr);
+        gpu_window_.mr = nullptr;
+    }
+    if (host_window_.mr) {
+        ibv_dereg_mr(host_window_.mr);
+        host_window_.mr = nullptr;
+    }
 
     if (qp_)  ibv_destroy_qp(qp_);
     if (cq_)  ibv_destroy_cq(cq_);
@@ -412,43 +420,53 @@ GDRCopyChannelImpl::~GDRCopyChannelImpl() {
 }
 
 // ── GPU MR registration ───────────────────────────────────────────────────────
-struct ibv_mr* GDRCopyChannelImpl::get_gpu_mr(uint64_t gpu_va, size_t len) {
-    struct ibv_mr* mr = mr_cache_.get(gpu_va, len);
-    if (mr) return mr;
+struct ibv_mr* GDRCopyChannelImpl::ensure_window_mr(
+    GDRCopyChannelImpl::RegisteredWindow& window,
+    uint64_t addr, size_t len,
+    bool is_gpu_window) {
+    if (len == 0)
+        return nullptr;
 
-    // Register: nvidia-peermem intercepts this call and pins the GPU pages.
-    struct ibv_mr* new_mr = ibv_reg_mr(pd_, reinterpret_cast<void*>(gpu_va),
+    uint64_t end = addr + len;
+    if (window.mr && addr >= window.base && end <= window.base + window.len)
+        return window.mr;
+
+    if (window.mr) {
+        ibv_dereg_mr(window.mr);
+        window.mr = nullptr;
+        window.base = 0;
+        window.len = 0;
+    }
+
+    struct ibv_mr* new_mr = ibv_reg_mr(pd_, reinterpret_cast<void*>(addr),
                                        len,
                                        IBV_ACCESS_LOCAL_WRITE  |
                                        IBV_ACCESS_REMOTE_WRITE |
                                        IBV_ACCESS_REMOTE_READ);
     if (!new_mr)
-        throw std::runtime_error("ibv_reg_mr on GPU VA 0x" +
-                                 std::to_string(gpu_va) + " failed (errno=" +
-                                 std::to_string(errno) + ")");
+        throw std::runtime_error(std::string("ibv_reg_mr on ") +
+                                 (is_gpu_window ? "GPU" : "host") +
+                                 " VA 0x" + std::to_string(addr) +
+                                 " failed (errno=" + std::to_string(errno) + ")");
 
-    // Evict LRU if cache is full
-    struct ibv_mr* evicted = mr_cache_.put(gpu_va, len, new_mr);
-    if (evicted) ibv_dereg_mr(evicted);
-
+    window.base = addr;
+    window.len = len;
+    window.mr = new_mr;
     return new_mr;
 }
 
+struct ibv_mr* GDRCopyChannelImpl::get_gpu_mr(uint64_t gpu_va, size_t len) {
+    // 只保留一个 GPU MR window；bench 会先用大块 buffer 预注册它。
+    return ensure_window_mr(gpu_window_, gpu_va, len, true);
+}
+
 struct ibv_mr* GDRCopyChannelImpl::get_host_mr(uint64_t host_va, size_t len) {
-    struct ibv_mr* mr = host_mr_cache_.get(host_va, len);
-    if (mr) return mr;
-
-    struct ibv_mr* new_mr = ibv_reg_mr(pd_, reinterpret_cast<void*>(host_va),
-                                       len,
-                                       IBV_ACCESS_LOCAL_WRITE  |
-                                       IBV_ACCESS_REMOTE_WRITE |
-                                       IBV_ACCESS_REMOTE_READ);
-    if (!new_mr) return nullptr;
-
-    struct ibv_mr* evicted = host_mr_cache_.put(host_va, len, new_mr);
-    if (evicted) ibv_dereg_mr(evicted);
-
-    return new_mr;
+    // host 侧同理，只维护一个覆盖当前工作区间的 MR。
+    try {
+        return ensure_window_mr(host_window_, host_va, len, false);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 // ── RDMA WRITE (H2D): pinned host → GPU ──────────────────────────────────────
